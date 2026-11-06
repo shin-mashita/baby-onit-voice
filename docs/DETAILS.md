@@ -215,3 +215,103 @@ Full measured numbers, the structural reason Qwen can't stream, and every
 silent-fallback trap hit while building this are in
 [ARCHITECTURE.md](ARCHITECTURE.md) — this document is the map, that one is the
 evidence.
+
+## 6. Measured latency (slides.pdf metrics table)
+
+**Setup.** Raspberry Pi 5 Model B Rev 1.1, 8 GB RAM, Debian 13 (trixie),
+passive cooling (52.1°C idle at measurement time, no throttling). Measured
+2026-11-07. The GPU host (Qwen3-ASR + Kokoro TTS, both on an RTX 2000 Ada,
+8 GB VRAM) is behind WSL2 NAT, reached via a reverse SSH tunnel onto the Pi's
+own loopback — so `127.0.0.1:8771`/`8772` in the numbers below is the real
+network path, not a same-host shortcut. LLM: Claude Sonnet 5 via Portkey
+(`@gcp-vertexai-us-global-integration/anthropic.claude-sonnet-5`) → Vertex AI,
+over the open internet from the Pi.
+
+**Method.** One clock (the Pi's `time.monotonic()`), matching the slide's own
+methodology. `scripts/bench_latency.py` (run from the Pi) exercises the real
+deployed stack end-to-end — same `speech_server` over the same tunnel, same
+`VoiceSession`/`baby_onit.dispatch("speak", ...)` call path production uses,
+not a synthetic stand-in:
+
+- **ASR final** (`end of speech → transcript`): opens the real `/asr`
+  websocket, streams two pre-recorded 16 kHz mono WAVs (`mytest.wav`,
+  `recording.wav`, 6 s each) frame-by-frame, times from the `finalize` send
+  (the client-side VAD-boundary equivalent) to the `line`/`no_speech` reply.
+  5 runs × 2 files = 10 trials.
+- **LLM TTFT** (`transcript → first token`): a fixed short prompt run through
+  the real `VoiceSession.ask()` → `agent_loop`; TTFT is read off the
+  `on_event("usage", ...)` the loop already emits (`model_s - decode_s`,
+  `baby_onit.py:1370-1382`) rather than added instrumentation. 5 runs.
+- **TTS TTFB** (`speak() call → first audio chunk`): times
+  `baby_onit.dispatch("speak", {"text": answer})` against a `/audio`
+  websocket opened *before* the call, matched by `utterance_id` on the first
+  frame. Same 5 runs, chained after the LLM call above.
+- **E2E** (`end of speech → audio out`): composed as ASR-final + the
+  transcript-to-audio leg (LLM TTFT through TTS TTFB) — the slide's own
+  chained definition — from the cross product of the two independently
+  measured legs (50 pairs), not 1:1 paired runs, since ASR has no dependency
+  on which transcript the LLM leg happened to receive.
+
+Raw per-run JSON: [`bench_results_2026-11-07.json`](bench_results_2026-11-07.json).
+
+| Metric | Definition | Mean | p95 | n |
+|---|---|---|---|---|
+| **E2E latency** | end of speech → audio out | **2122 ms** | **4060 ms** | 50 (composed) |
+| **ASR final** | end of speech → transcript | **440 ms** | **747 ms** | 10 |
+| **LLM TTFT** | transcript → first token | **1431 ms** | **3129 ms** | 5 |
+| **TTS TTFB** | `speak()` call → first audio chunk | **218 ms** | **323 ms** | 5 |
+| **Barge-in** | speech → playback stopped | **~300 ms** | — | see note |
+
+Notes on the numbers themselves:
+
+- **ASR final has two distinct clusters** (`mytest.wav`: 192–497 ms;
+  `recording.wav`: 557–747 ms) — content-dependent decode time on Qwen3-ASR's
+  autoregressive decoder, not noise; this is exactly why n=10 across two
+  different recordings was used rather than one file repeated.
+- **LLM TTFT's p95 is a single cold-start outlier** (run 0: 3129 ms vs.
+  849–1151 ms for runs 1-4) — first-call client/connection setup to Portkey,
+  not steady-state. Steady-state mean across runs 1-4 alone: ~1006 ms.
+- **Barge-in** is **not** re-measured here: this Pi's mic (USB) and speaker
+  (Bluetooth) are acoustically separate devices in the same room with no AEC
+  implemented in this codebase (see the acoustic-echo self-interruption issue
+  worked around during bringup), making a live acoustic barge-in test
+  unreliable right now. The number above is composed from existing,
+  already-verified measurements instead: the client requires `barge_in_ms`
+  (300 ms, `voice_client/config.py:40`) of *sustained* VAD-positive speech
+  before honoring a barge-in — that threshold dominates — plus
+  `player.flush()` and `cancel_stream()`, both measured at effectively 0 ms
+  (ARCHITECTURE.md, TTS table, "`cancel_stream()` **0.0 ms**"). Total is the
+  threshold itself, ~300 ms, not a new measurement.
+
+### 6.1 Which of these are network-bound?
+
+Measured the floor for each hop directly, rather than guessing:
+
+| Hop | Measured floor | vs. measured stage latency |
+|---|---|---|
+| Pi → tunnel → `speech_server` (ASR/TTS) | TCP connect ~0.1 ms, full HTTP round trip ~6-10 ms | ASR 200-750 ms, TTS TTFB 218 ms mean — floor is **negligible** |
+| Pi → internet → Portkey (LLM) | TLS handshake ~10-35 ms warm; time-to-first-byte on a trivial request **0.31 s / 1.07 s / 2.28 s** across three back-to-back calls | LLM TTFT 849-3129 ms — same variance pattern, same order of magnitude |
+
+**ASR final and TTS TTFB are compute-bound, not network-bound.** The
+tunnel's own round trip is 2-3 orders of magnitude smaller than either stage's
+measured latency — Qwen3-ASR's decode time and Kokoro's GPU synthesis time
+dominate, and the WSL2-NAT reverse-tunnel hop this deployment depends on
+(see [rpi_app/README.md](../rpi_app/README.md)) costs essentially nothing extra.
+
+**LLM TTFT is partly network/gateway-bound.** Portkey's own time-to-first-byte
+on a request with *no* model computation in it (a bare `GET /v1`) varied by
+**7x** across three calls with no change on this end. That variance lines up
+almost exactly with the LLM TTFT spread (849-3129 ms) and explains the run-0
+cold-start outlier directly: the `openai` client's first request pays full
+DNS + TCP connect + TLS + Portkey-routing cost, and later requests on the
+same connection land in the cheaper ~850-1150 ms band. This means a
+meaningful share of LLM TTFT — and nearly all of its p95 — is Portkey/network
+variability, not Claude's own token-generation time.
+
+**E2E inherits that network sensitivity** through its LLM leg, the largest
+single component of the composed total.
+
+**Barge-in has no network dependency at all.** VAD detection, `player.flush()`,
+and the generation-counter cancellation are entirely local to the Pi — the
+~300 ms figure is a configured sustained-speech threshold (`barge_in_ms`),
+not a round trip to anything.

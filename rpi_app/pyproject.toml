@@ -1,0 +1,64 @@
+[project]
+name = "baby-onit"
+version = "0.1.0"
+description = "Tiny single-file agent harness distilled from onit — for teaching how an agent harness works."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Rowel Atienza" }]
+dependencies = [
+  "openai>=1.40",
+  "ollama>=0.4",
+  "pyyaml>=6.0",
+  "requests>=2.31",
+  "beautifulsoup4>=4.12",
+  "pypdf>=4.0",
+  "rich>=13.0",
+  "keyring>=24.0",
+]
+
+[project.optional-dependencies]
+# Voice agent. Kept out of the core deps so `pip install -e .` still gives the
+# plain text harness: McpHub imports `mcp` lazily, and nothing in baby_onit.py
+# imports the speech stack at all.
+voice = [
+  "mcp>=2.0",            # MCP client for the TTS control plane
+  "moonshine-voice>=0.1.5",  # streaming ASR + Kokoro-vocoder TTS, CPU-only
+  "websockets>=12.0",    # ASR + TTS audio transports
+  "starlette>=0.37",     # ASGI app hosting the MCP + audio endpoints
+  "uvicorn>=0.30",       # server for both
+  "sounddevice>=0.5",    # mic capture and playback
+  "numpy>=1.26",
+  "fastapi>=0.110",      # voice_ui dashboard
+]
+
+# TTS on the GPU. Separate from `voice` because it is optional (falls back to
+# Moonshine TTS on CPU) and the pin matters: onnxruntime-gpu>=1.23 requires
+# CUDA 13 / driver R580+ and silently falls back to CPU otherwise, which is
+# indistinguishable from a working GPU path apart from one log line. 1.22.0 is
+# the last release built against CUDA 12, which works via minor-version
+# compatibility on driver 535+. See ARCHITECTURE.md §1.1 before changing this.
+#
+# `kokoro-onnx` is deliberately NOT listed here: its PyPI metadata requires a
+# plain, unpinned `onnxruntime` unconditionally (its own `[gpu]` extra adds
+# `onnxruntime-gpu` on *top* of that, it does not replace it), and both
+# packages ship to the same `onnxruntime/` import path. Installing both
+# resolves whichever onnxruntime-gpu grabs last on disk and has, in practice,
+# pulled in 1.31 -- a CUDA-13 build that silently falls back to CPU. Install
+# kokoro-onnx itself with `--no-deps` (see setup.sh) and let this extra supply
+# its real dependencies instead, pinned.
+voice-gpu-tts = [
+  "espeakng-loader>=0.2.4",
+  "phonemizer>=3.4.0",
+  "onnxruntime-gpu==1.22.0",
+]
+
+[project.scripts]
+baby-onit = "baby_onit:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["baby_onit.py", "speech_server", "voice_client", "voice_ui"]

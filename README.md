@@ -112,6 +112,94 @@ line. Context compaction is checked at the top of each loop iteration against
 a fresh estimate, so an oversized result is summarised *before* the request
 that would carry it is sent.
 
+## Voice agent (full-duplex, Raspberry Pi)
+
+This repo also carries a full-duplex voice agent built on the harness above:
+`voice_client` + `voice_ui` run on a **Raspberry Pi** (mic, speaker, VAD,
+dashboard); `speech_server` (Qwen3-ASR + Kokoro TTS, both on GPU) runs on a
+**separate GPU machine**; the LLM is Claude Sonnet 5 via Portkey, reached from
+the Pi over the open internet. Full architecture, measured latency, and the
+verbatim system prompt are in [docs/DETAILS.md](docs/DETAILS.md); an
+evaluation infographic is at
+[docs/eval_infographic.html](docs/eval_infographic.html).
+
+### One-time setup
+
+**GPU machine** (serves ASR + TTS):
+
+```bash
+bash scripts/setup.sh --gpu-tts      # base venv + Kokoro TTS on CUDA
+bash scripts/setup_qwen.sh           # Qwen3-ASR, separate venv (.venv-qwen)
+```
+
+If the GPU machine is reachable from the Pi's LAN directly, skip the tunnel
+below and put that machine's real IP in the Pi's `voice.yaml`. If it's
+behind NAT (e.g. **WSL2**, whose own IP is not reachable from other LAN
+devices), set up a reverse SSH tunnel instead — it works because the GPU
+machine can always reach the Pi outbound, even though the Pi can't reach it
+inbound:
+
+```bash
+ssh-copy-id <pi-user>@<pi-host>                      # passwordless, needed for an unattended tunnel
+sed -e 's/PI_USER/<pi-user>/' -e 's/PI_HOST/<pi-host>/' \
+  scripts/pi-reverse-tunnel.service.template \
+  > ~/.config/systemd/user/pi-reverse-tunnel.service
+systemctl --user daemon-reload
+systemctl --user enable --now pi-reverse-tunnel.service
+loginctl enable-linger "$USER"                       # survives logout/reboot, needs sudo once
+```
+
+**Raspberry Pi** (runs the harness + voice client + dashboard):
+
+```bash
+scp -r rpi_app <pi-user>@<pi-host>:~/Desktop/
+ssh <pi-user>@<pi-host> 'cd ~/Desktop/rpi_app && bash setup.sh'
+```
+
+Then on the Pi: edit `~/.baby-onit/voice.yaml` (point `SPEECH_SERVER_HOST`
+at the GPU machine, or `127.0.0.1` if using the tunnel above), and run
+`baby-onit setup` once to store the LLM API key. Full detail, including the
+ALSA fix for USB mic/speaker sample-rate mismatches, is in
+[rpi_app/README.md](rpi_app/README.md).
+
+### Bringing it up
+
+**GPU machine** — one script, idempotent (safe to re-run; skips anything
+already healthy):
+
+```bash
+bash scripts/serve_backends.sh       # starts Qwen3-ASR (vLLM) + speech_server in the background
+tail -f logs/*.log                   # watch startup
+bash scripts/stop_backends.sh        # stop both; leaves the tunnel running
+```
+
+**Raspberry Pi**:
+
+```bash
+ssh <pi-user>@<pi-host> 'cd ~/Desktop/rpi_app && bash run.sh'
+# dashboard: http://<pi-ip>:7860
+```
+
+### Bringing it back up when the network changes
+
+The reverse tunnel is an **outbound** connection from the GPU machine to the
+Pi, so a network change on the GPU machine's side (a new WSL2 IP after a
+reboot, a different Wi-Fi network, a new router) never breaks it — only a
+change to the **Pi's** own address does, and `systemd`'s `Restart=always`
+already recovers from everything else (a dropped SSH session, the GPU
+machine rebooting). If the Pi's IP changes:
+
+```bash
+# on the GPU machine, after editing PI_HOST in the unit file:
+systemctl --user edit --full pi-reverse-tunnel.service   # or re-run the sed command above
+systemctl --user restart pi-reverse-tunnel.service
+```
+
+Everything else — `serve_backends.sh` on the GPU machine, `run.sh` on the
+Pi — has no network-identity baked in beyond `127.0.0.1`, so re-running them
+after any network change (including this laptop's own IP changing) just
+works without edits.
+
 ## How it works
 
 The full architecture — the section-by-section map of `baby_onit.py`, the

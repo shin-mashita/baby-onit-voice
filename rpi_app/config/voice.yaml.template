@@ -1,0 +1,24 @@
+# voice_client configuration template for the Pi.
+#
+# Points the ASR/TTS websockets at the GPU laptop's speech_server. Default
+# here is 127.0.0.1 because the laptop side runs a reverse SSH tunnel (see
+# README.md "Networking") that forwards its own 8771/8772 onto the Pi's
+# loopback -- this sidesteps WSL2 NAT entirely and needs no Windows admin.
+# If you expose speech_server differently (mirrored networking, netsh
+# portproxy), replace 127.0.0.1 with that host instead.
+voice:
+  asr:
+    url: ws://127.0.0.1:8771/asr
+    language: en
+    keyterms: ["flappy bird", "web game"]
+  tts:
+    mcp_url: http://127.0.0.1:8772/mcp
+    audio_url: ws://127.0.0.1:8772/audio
+  audio:
+    # 'voiceagent' is the ALSA plug device setup.sh creates in ~/.asoundrc,
+    # wrapping the USB mic/speaker so it accepts 16kHz capture (its raw hw
+    # device only accepts its native rate, usually 48kHz). If setup.sh
+    # didn't find a USB card, set these back to null for the system default.
+    input_device: voiceagent
+    output_device: voiceagent
+    aec: true

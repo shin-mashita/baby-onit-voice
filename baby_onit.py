@@ -1392,7 +1392,6 @@ async def agent_loop(
         ]
         for c, raw in zip(calls, raw_calls):
             c["id"] = raw.get("id") or c.get("id") or c["name"]
-        messages.append({"role": "assistant", "content": msg["content"], "tool_calls": raw_calls})
 
         async def run_one(c):
             say("tool", f"{c['name']}({json.dumps(c['arguments'])[:120]})")
@@ -1419,6 +1418,16 @@ async def agent_loop(
         else:
             consecutive_errors = 0
         iteration += 1
+        # Appended here, not before the tool calls run: a "free retry" above
+        # (`continue`) must never leave this message in `messages` without its
+        # tool-result siblings immediately after -- Anthropic/Vertex rejects a
+        # `tool_use` block with no `tool_result` in the very next message
+        # (measured: orphaned assistant tool_calls message from the dangling
+        # append, surfaced as "tool_use ids were found without tool_result
+        # blocks"). Appending both only on this surviving path keeps that
+        # invariant automatically, including for any future early-exit added
+        # to this loop.
+        messages.append({"role": "assistant", "content": msg["content"], "tool_calls": raw_calls})
         for c, result in results:
             # tool result for either family (ollama: tool_name; OpenAI: tool_call_id)
             messages.append(

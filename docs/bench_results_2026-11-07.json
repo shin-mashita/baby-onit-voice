@@ -1,0 +1,203 @@
+{
+  "log": [
+    {
+      "t": "2026-11-06T17:30:32",
+      "run": "asr/mytest.wav/0",
+      "asr_final_s": 0.4974
+    },
+    {
+      "t": "2026-11-06T17:30:32",
+      "run": "asr/mytest.wav/1",
+      "asr_final_s": 0.2234
+    },
+    {
+      "t": "2026-11-06T17:30:33",
+      "run": "asr/mytest.wav/2",
+      "asr_final_s": 0.2014
+    },
+    {
+      "t": "2026-11-06T17:30:33",
+      "run": "asr/mytest.wav/3",
+      "asr_final_s": 0.1916
+    },
+    {
+      "t": "2026-11-06T17:30:33",
+      "run": "asr/mytest.wav/4",
+      "asr_final_s": 0.2094
+    },
+    {
+      "t": "2026-11-06T17:30:34",
+      "run": "asr/recording.wav/0",
+      "asr_final_s": 0.5577
+    },
+    {
+      "t": "2026-11-06T17:30:34",
+      "run": "asr/recording.wav/1",
+      "asr_final_s": 0.604
+    },
+    {
+      "t": "2026-11-06T17:30:35",
+      "run": "asr/recording.wav/2",
+      "asr_final_s": 0.5972
+    },
+    {
+      "t": "2026-11-06T17:30:36",
+      "run": "asr/recording.wav/3",
+      "asr_final_s": 0.5707
+    },
+    {
+      "t": "2026-11-06T17:30:37",
+      "run": "asr/recording.wav/4",
+      "asr_final_s": 0.7466
+    },
+    {
+      "t": "2026-11-06T17:30:41",
+      "run": "llm_tts/0",
+      "llm_ttft_s": 3.129,
+      "llm_total_s": 3.13,
+      "tts_ttfb_s": 0.3229,
+      "e2e_transcript_to_audio_s": 3.463,
+      "answer_chars": 21
+    },
+    {
+      "t": "2026-11-06T17:30:42",
+      "run": "llm_tts/1",
+      "llm_ttft_s": 1.034,
+      "llm_total_s": 1.0362,
+      "tts_ttfb_s": 0.1318,
+      "e2e_transcript_to_audio_s": 1.1781,
+      "answer_chars": 21
+    },
+    {
+      "t": "2026-11-06T17:30:44",
+      "run": "llm_tts/2",
+      "llm_ttft_s": 0.849,
+      "llm_total_s": 0.8521,
+      "tts_ttfb_s": 0.1985,
+      "e2e_transcript_to_audio_s": 1.0583,
+      "answer_chars": 21
+    },
+    {
+      "t": "2026-11-06T17:30:45",
+      "run": "llm_tts/3",
+      "llm_ttft_s": 0.991,
+      "llm_total_s": 1.0926,
+      "tts_ttfb_s": 0.2424,
+      "e2e_transcript_to_audio_s": 1.3513,
+      "answer_chars": 21
+    },
+    {
+      "t": "2026-11-06T17:30:46",
+      "run": "llm_tts/4",
+      "llm_ttft_s": 1.151,
+      "llm_total_s": 1.1574,
+      "tts_ttfb_s": 0.1952,
+      "e2e_transcript_to_audio_s": 1.3608,
+      "answer_chars": 21
+    }
+  ],
+  "summary": [
+    {
+      "metric": "E2E latency (end of speech -> audio out)",
+      "n": 50,
+      "mean_ms": 2122.2,
+      "p95_ms": 4060.2,
+      "values_ms": [
+        1249.9,
+        1259.6,
+        1267.7,
+        1281.7,
+        1369.7,
+        1379.4,
+        1387.5,
+        1401.5,
+        1542.9,
+        1552.4,
+        1552.6,
+        1555.7,
+        1560.7,
+        1562.1,
+        1570.2,
+        1574.7,
+        1584.2,
+        1616.0,
+        1628.9,
+        1655.4,
+        1662.3,
+        1675.5,
+        1735.8,
+        1748.7,
+        1775.2,
+        1782.1,
+        1804.8,
+        1848.7,
+        1858.2,
+        1909.0,
+        1918.5,
+        1921.9,
+        1924.6,
+        1931.4,
+        1948.4,
+        1955.3,
+        1957.9,
+        1964.8,
+        2097.8,
+        2107.3,
+        3654.6,
+        3664.4,
+        3672.4,
+        3686.4,
+        3960.4,
+        4020.7,
+        4033.7,
+        4060.2,
+        4067.0,
+        4209.6
+      ]
+    },
+    {
+      "metric": "ASR final (end of speech -> transcript)",
+      "n": 10,
+      "mean_ms": 439.9,
+      "p95_ms": 746.6,
+      "values_ms": [
+        191.6,
+        201.4,
+        209.4,
+        223.4,
+        497.4,
+        557.7,
+        570.7,
+        597.2,
+        604.0,
+        746.6
+      ]
+    },
+    {
+      "metric": "LLM TTFT (transcript -> first token)",
+      "n": 5,
+      "mean_ms": 1430.8,
+      "p95_ms": 3129.0,
+      "values_ms": [
+        849.0,
+        991.0,
+        1034.0,
+        1151.0,
+        3129.0
+      ]
+    },
+    {
+      "metric": "TTS TTFB (speak() call -> first audio chunk)",
+      "n": 5,
+      "mean_ms": 218.2,
+      "p95_ms": 322.9,
+      "values_ms": [
+        131.8,
+        195.2,
+        198.5,
+        242.4,
+        322.9
+      ]
+    }
+  ]
+}

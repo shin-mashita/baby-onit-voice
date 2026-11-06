@@ -1,0 +1,24 @@
+[Unit]
+Description=Reverse SSH tunnel exposing speech_server (8771/8772) to the Pi
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Outbound from this machine to the Pi -- this is why it survives a WSL2/
+# network IP change on THIS side untouched. If the PI's address changes,
+# edit PI_USER@PI_HOST below and `systemctl --user restart pi-reverse-tunnel`.
+ExecStart=/usr/bin/ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=accept-new \
+  -R 8771:127.0.0.1:8771 \
+  -R 8772:127.0.0.1:8772 \
+  PI_USER@PI_HOST
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -17,6 +17,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+
 from .state import LOCK, STATE
 
 log = logging.getLogger(__name__)
@@ -96,9 +99,13 @@ HUB = Hub()
 
 
 def build_app(hub: Hub = HUB):
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.responses import FileResponse, JSONResponse
-
+    # FastAPI/WebSocket must be module-level imports (not local to this
+    # function): with `from __future__ import annotations`, the `ws: WebSocket`
+    # annotation on the nested ws_endpoint below becomes a string, and FastAPI
+    # resolves it via the function's __globals__ (this module), not via
+    # build_app()'s local scope. A local import here leaves "WebSocket"
+    # undefined there, so dependency resolution fails silently and every
+    # handshake gets rejected with 403 -- no exception, no log line.
     app = FastAPI(title="voice-agent")
 
     @app.get("/")

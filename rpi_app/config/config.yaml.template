@@ -1,0 +1,15 @@
+# baby-onit configuration template for the Pi.
+#
+# This file does NOT hold secrets. After setup.sh runs, this gets copied to
+# ~/.baby-onit/config.yaml; then run `baby-onit setup` once to paste in the
+# Portkey API key for serving.host below -- stored in
+# ~/.baby-onit/secrets.yaml (0600) since setup.sh forces the file-based
+# keyring fallback, never in this file.
+#
+# Model id carries Portkey's routing (docs/ARCHITECTURE.md §5.10):
+# '@<integration-slug>/<model>'. Replace the integration slug below with
+# whatever your Portkey dashboard's Integrations page shows for this model.
+data_path: ~/baby-sandbox
+serving:
+  host: https://api.portkey.ai/v1
+  model: '@gcp-vertexai-us-global-integration/anthropic.claude-sonnet-5'

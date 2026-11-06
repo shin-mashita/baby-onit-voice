@@ -10,3 +10,4 @@ tmp
 .venv/
 .venv-qwen/
 voice.yaml
+logs/
