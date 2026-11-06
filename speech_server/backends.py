@@ -12,6 +12,7 @@ VOICE_PROTOCOL.md §4.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import time
@@ -327,7 +328,40 @@ class KokoroOnnxTts:
             tmp.replace(p)  # atomic: a partial file never looks cached
         return p
 
+    @staticmethod
+    def _preload_cuda_libs() -> int:
+        """Pull the pip-installed CUDA libraries into the process by hand.
+
+        onnxruntime-gpu does not add the `nvidia/*/lib` wheel directories to the
+        search path, and the dynamic loader reads LD_LIBRARY_PATH only at process
+        start, so an in-process fix cannot use it. Without this the CUDA provider
+        fails with "libcublasLt.so.12: cannot open shared object file", falls back
+        to CPU, and synthesizes anyway -- a working GPU path and a working CPU
+        path look identical apart from one log line.
+        """
+        import ctypes
+        import glob
+        import site
+
+        roots = list(site.getsitepackages())
+        if (user := site.getusersitepackages()) not in roots:
+            roots.append(user)
+        loaded = 0
+        for root in roots:
+            # cublasLt before cublas: the latter needs the former already resident.
+            for so in sorted(glob.glob(os.path.join(root, "nvidia", "*", "lib", "*.so*"))):
+                try:
+                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+                    loaded += 1
+                except OSError:
+                    continue  # a lib this build does not need
+        return loaded
+
     def load(self) -> "KokoroOnnxTts":
+        if self.prefer_gpu:
+            n = self._preload_cuda_libs()
+            log.debug("preloaded %d CUDA libraries for onnxruntime", n)
+
         import onnxruntime as ort
         from kokoro_onnx import Kokoro
 
@@ -435,7 +469,16 @@ class KokoroOnnxTts:
             self._k = None
 
 
-def make_backend(kind: str, *, language: str, voice: str) -> TtsBackend:
+#: Where a model is loaded. "auto" prefers the GPU and silently accepts CPU;
+#: "gpu" and "cpu" are assertions -- "gpu" fails loudly rather than degrading,
+#: because a silent CPU fallback is indistinguishable from success apart from
+#: one log line (see KokoroOnnxTts.load).
+DEVICES = ("auto", "gpu", "cpu")
+
+
+def make_backend(
+    kind: str, *, language: str, voice: str, device: str = "auto"
+) -> TtsBackend:
     """Build a backend by name, falling back to Moonshine when asked to.
 
     "kokoro" is the default because it keeps synthesis off the CPU cores ASR
@@ -443,13 +486,30 @@ def make_backend(kind: str, *, language: str, voice: str) -> TtsBackend:
     an unusable GPU by handing back the CPU engine, which is slower in aggregate
     but always available.
     """
+    if device not in DEVICES:
+        raise ValueError(f"tts device must be one of {DEVICES}, not {device!r}")
     if kind == "moonshine":
+        if device == "gpu":
+            raise ValueError(
+                "moonshine TTS is CPU-only: its bundled onnxruntime registers no CUDA "
+                "provider and `use_cuda` is accepted but inert. Use --tts-backend kokoro "
+                "for the GPU path."
+            )
         return MoonshineTts(language=language, voice=voice)
+    prefer_gpu = device != "cpu"
     if kind in ("kokoro", "kokoro-onnx"):
-        return KokoroOnnxTts(voice=voice, lang=language)
+        backend = KokoroOnnxTts(voice=voice, lang=language, prefer_gpu=prefer_gpu)
+        if device == "gpu":
+            backend.load()  # surface a CUDA failure now, not on the first utterance
+            if not backend.on_gpu:
+                raise RuntimeError(
+                    f"--tts-load gpu requested but Kokoro resolved to {backend.provider}. "
+                    "Refusing to run on CPU under an explicit gpu request."
+                )
+        return backend
     if kind in ("auto", "kokoro-or-moonshine"):
         try:
-            return KokoroOnnxTts(voice=voice, lang=language).load()
+            return KokoroOnnxTts(voice=voice, lang=language, prefer_gpu=prefer_gpu).load()
         except Exception as e:  # noqa: BLE001 -- any failure means fall back
             log.warning("kokoro-onnx unavailable (%s: %s); falling back to Moonshine TTS",
                         type(e).__name__, e)

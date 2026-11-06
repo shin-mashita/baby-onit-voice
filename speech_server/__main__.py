@@ -25,7 +25,7 @@ from .asr_ws import (
     AsrModel,
     build_asr_app,
 )
-from .backends import DEFAULT_LANGUAGE, DEFAULT_VOICE, make_backend
+from .backends import DEFAULT_LANGUAGE, DEFAULT_VOICE, DEVICES, make_backend
 from .tts_audio_ws import AudioHub
 from .tts_mcp import TtsService, build_tts_app
 
@@ -86,16 +86,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--tts-backend",
-        default="moonshine",
+        default="auto",
         choices=["auto", "kokoro", "moonshine"],
         help=(
-            "moonshine (default): CPU-only; contends with ASR for cores, which "
-            "voice_client mitigates by parking the mic during playback. "
-            "kokoro: kokoro-onnx, which is FASTER ONLY ON A WORKING GPU -- on CPU "
-            "it is slower than moonshine (746ms vs ~500ms TTFA). auto: kokoro "
-            "with a moonshine fallback. See ARCHITECTURE.md 1.1 -- CUDA does not "
-            "currently initialize on this machine"
+            "auto (default): kokoro-onnx on CUDA, falling back to moonshine if the "
+            "GPU is unusable. On GPU kokoro runs at RTF 0.047 in ~620 MiB of VRAM, "
+            "which also takes synthesis off the CPU cores ASR needs. moonshine: "
+            "CPU-only, RTF 0.25, and contends with ASR for cores"
         ),
+    )
+    p.add_argument(
+        "--tts-load",
+        default="auto",
+        choices=DEVICES,
+        help=(
+            "where to load TTS. auto: prefer GPU, accept CPU. gpu: require CUDA and "
+            "fail rather than silently degrade. cpu: force CPU (Kokoro RTF 0.25)"
+        ),
+    )
+    p.add_argument(
+        "--asr-load",
+        default="cpu",
+        choices=DEVICES,
+        help=(
+            "where to load ASR. cpu (default): Moonshine, CPU-only, genuinely "
+            "frame-streaming with partials. gpu: Qwen3-ASR via a vLLM server "
+            "(--qwen-url); needs ~7.2 GiB so TTS must be on CPU, and emits NO partials"
+        ),
+    )
+    p.add_argument(
+        "--qwen-url",
+        default="http://127.0.0.1:8773/v1",
+        help="OpenAI-compatible vLLM endpoint serving Qwen3-ASR (used by --asr-load gpu)",
     )
     p.add_argument(
         "--keyterm-boost",
@@ -116,6 +138,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--log-level", default="info")
     args = p.parse_args(argv)
+    if args.asr_load == "gpu" and args.tts_load == "gpu":
+        # This combination DOES fit, but only when the Qwen server is started
+        # with explicit KV sizing. Measured together: 6459 MiB of 8192, with
+        # 1733 MiB spare (Qwen 5825 + Kokoro 634). Loading Qwen through the
+        # in-process LLM() API instead takes 7389 MiB, because its memory
+        # profiling overshoots, and then the pair genuinely does not fit --
+        # which is why scripts_qwen_serve.sh pins --kv-cache-memory.
+        log.info(
+            "asr+tts both on GPU: fits with scripts_qwen_serve.sh (measured 6459/8192 MiB). "
+            "If the Qwen server was started without --kv-cache-memory it will take 7389 MiB "
+            "and this pair will OOM."
+        )
     if args.keyterm_boost > KEYTERM_BOOST_MAX:
         log.warning(
             "--keyterm-boost %.1f exceeds the safe ceiling %.1f; clamping. Past this "
@@ -153,6 +187,12 @@ async def _serve(args: argparse.Namespace) -> int:
     t0 = time.monotonic()
     model = await asyncio.to_thread(AsrModel.resolve, args.language, args.model_arch)
     log.info("asr model %s resolved in %.2fs", model.label, time.monotonic() - t0)
+    if args.asr_load == "gpu":
+        log.warning(
+            "ASR is Qwen3-ASR at %s: NO partial transcripts (it has no frame-level "
+            "emission); text arrives once per utterance when the client finalizes",
+            args.qwen_url,
+        )
 
     # t0 before make_backend, not after: the "auto" backend has to load in order
     # to find out whether CUDA works before it can decide to fall back, so a t0
@@ -160,7 +200,9 @@ async def _serve(args: argparse.Namespace) -> int:
     # asset download as unattributed dead time. backend.load() is idempotent, so
     # the await below is a no-op when the factory already did the work.
     t0 = time.monotonic()
-    backend = make_backend(args.tts_backend, language=args.tts_language, voice=args.voice)
+    backend = make_backend(
+        args.tts_backend, language=args.tts_language, voice=args.voice, device=args.tts_load
+    )
     await asyncio.to_thread(backend.load)
     # Say which provider actually won: a CUDA EP that fails to initialize falls
     # back to CPU and still synthesizes, so "kokoro" alone does not mean "GPU".
@@ -186,8 +228,12 @@ async def _serve(args: argparse.Namespace) -> int:
 
     servers = [
         _make_server(
-            build_asr_app(model, update_interval=args.update_interval,
-                          keyterm_boost=args.keyterm_boost),
+            build_asr_app(
+                model,
+                update_interval=args.update_interval,
+                keyterm_boost=args.keyterm_boost,
+                qwen_url=args.qwen_url if args.asr_load == "gpu" else None,
+            ),
             args.host, args.asr_port,
         ),
         _make_server(build_tts_app(service, hub), args.host, args.tts_port),

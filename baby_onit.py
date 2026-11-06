@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -530,6 +531,22 @@ clause is a long silence.
 - Answer the question first, in one or two sentences. Offer detail only if it \
 was asked for.
 
+Long jobs go to the background. Anything that will take more than a few \
+seconds -- writing an app, a large refactor -- goes to `start_task`, which \
+returns an id at once. Never do a long job in the foreground: the person cannot \
+talk to you while you do, which is the single worst thing you can do to a \
+conversation.
+- "Long" includes **starting or serving anything**: a dev server, a Flask app, \
+a watcher. Those never finish, so running one in the foreground hangs the \
+conversation until the tool times out.
+- Call `start_task` **once** per request. It returns an id; that means the work \
+is under way. Do not call it again for the same job, and do not call it again \
+because you are unsure -- call `check_task` instead.
+- After starting one, say so out loud and stop. Do not keep working in the \
+foreground to "help" -- the task is already doing it.
+- When asked how it is going, `check_task` and report the step it is on.
+- Stop one only when asked, with `cancel_task`.
+
 Speaking is a tool call: `speak`. It returns immediately -- it does not wait \
 for the audio to finish -- so you can keep working while your words play.
 - Call `speak` as your FIRST action on any task that will take more than a \
@@ -909,6 +926,39 @@ def tool(name: str, description: str, fn: Callable[..., str]) -> None:
     )
 
 
+#: The VoiceSession that owns delegated work, set while a voice session is
+#: open. Module-level for the same reason _ALARMS is: TOOLS holds plain
+#: functions, so a tool reaches its session through here rather than through a
+#: parameter the model would have to supply.
+_TASK_HOST: Any = None
+
+
+async def tool_start_task(task: str) -> str:
+    """Delegate a long task to a background agent. Returns at once with its id."""
+    if _TASK_HOST is None:
+        return _tool_error(
+            "E_TOOL", tool="start_task",
+            err="no voice session; background tasks exist only in voice mode",
+        )
+    if not (task or "").strip():
+        return _tool_error("E_ARGS", tool="start_task", bad="task is empty")
+    return json.dumps(_TASK_HOST.start_background(task.strip()))
+
+
+async def tool_check_task(task_id: int = 0) -> str:
+    """Progress of a background task, or of all of them when task_id is 0."""
+    if _TASK_HOST is None:
+        return _tool_error("E_TOOL", tool="check_task", err="no voice session")
+    return json.dumps(_TASK_HOST.background_status(task_id or None))
+
+
+async def tool_cancel_task(task_id: int) -> str:
+    """Stop a background task."""
+    if _TASK_HOST is None:
+        return _tool_error("E_TOOL", tool="cancel_task", err="no voice session")
+    return json.dumps(await _TASK_HOST.cancel_background(task_id))
+
+
 for _name, _desc, _fn in [
     ("web_search", "Search the web. Use type='news' for dated/recent items.", tool_web_search),
     ("fetch_content", "Fetch a URL and return its text (handles PDFs).", tool_fetch_content),
@@ -927,9 +977,36 @@ for _name, _desc, _fn in [
     ("grep", "Recursive regex search across files.", tool_grep),
     ("set_alarm", "Set a one-shot alarm. when='07:00', '7am', or 'in 10 minutes'.", tool_set_alarm),
     ("list_alarms", "List alarms set this session.", tool_list_alarms),
+    (
+        "start_task",
+        (
+            "Delegate a long job (writing an app, a big refactor) to a background "
+            "agent and get its id back immediately, so you stay free to talk. Use "
+            "this for anything that will take more than a few seconds."
+        ),
+        tool_start_task,
+    ),
+    (
+        "check_task",
+        "Progress of a background task; task_id=0 lists all of them.",
+        tool_check_task,
+    ),
+    ("cancel_task", "Stop a background task.", tool_cancel_task),
 ]:
     tool(_name, _desc, _fn)
-READ_ONLY = {"web_search", "fetch_content", "read_file", "local_search", "grep", "list_alarms"}
+READ_ONLY = {"web_search", "fetch_content", "read_file", "local_search", "grep",
+             "list_alarms", "check_task"}
+#: Tools a delegated worker must not see. A worker that can delegate will:
+#: observed, one request produced task 1 -> task 2 -> task 3, each worker
+#: re-reading "long jobs go to the background" and obeying it. A worker IS the
+#: background; its job is to do the work.
+DELEGATION_TOOLS = {"start_task", "cancel_task", "check_task"}
+
+#: Exempt from the repeated-call guard in dispatch(). Asking the same status
+#: question twice is not a loop, it is the point: "how is it going" five times
+#: during a long build is normal conversation, and the guard would answer E_LOOP
+#: instead of the status.
+POLLABLE = {"check_task", "list_alarms", "is_speaking"}
 # Session-scoped alarms. Deliberately not persisted: the voice agent is a
 # long-lived process, and an alarm that outlives it would fire into silence.
 _ALARMS: list[dict] = []
@@ -1139,10 +1216,17 @@ async def dispatch(name: str, args: dict) -> str:
     except Exception:  # noqa: BLE001 — model may emit truncated JSON; the error is the reply
         return _tool_error("E_PARSE", tool=name, raw=str(args)[:200])
     key = (name, json.dumps(args := _coerce_args(name, args), sort_keys=True))
+    if name in POLLABLE:
+        return await _invoke(name, args)
     _call_history.append(key)
     if _call_history.count(key) >= 5:
         return _tool_error("E_LOOP", tool=name, repeats=5,
                            hint="same call 5x — change approach or answer without tools")
+    return await _invoke(name, args)
+
+
+async def _invoke(name: str, args: dict) -> str:
+    """Run one tool, mapping its failures onto the machine-readable error codes."""
     fn = TOOLS[name][1]
     try:
         # MCP tools are natively async; in-process tools are blocking functions
@@ -1262,8 +1346,21 @@ async def agent_loop(
         # in the task text, and spoken requests routinely miss them -- "set an
         # alarm at 7 am" matches no hint, so without this the agent would think
         # with no way to say anything.
-        call_tools = [schema for schema, _ in TOOLS.values()]
-        if iteration == 1 and not cfg.get("voice") and not _task_needs_tools(task):
+        call_tools = [
+            schema
+            for name, (schema, _) in TOOLS.items()
+            if not (cfg.get("background") and name in DELEGATION_TOOLS)
+        ]
+        # Voice mode and delegated workers both opt out: a task that was handed
+        # to start_task is by definition work, and "Create a polished Flappy
+        # Bird game" matches no hint word, so the guard would hand the worker no
+        # tools and it would answer in prose having built nothing.
+        if (
+            iteration == 1
+            and not cfg.get("voice")
+            and not cfg.get("background")
+            and not _task_needs_tools(task)
+        ):
             call_tools = None
         msg, usage = await provider.chat(
             messages,
@@ -1522,6 +1619,54 @@ def _provider_label(host: str) -> str:
 # but cannot host a microphone: the ASR socket, the audio socket and the MCP
 # sessions all have to outlive a single answer, and a barge-in has to cancel a
 # turn that is still running. This owns that lifecycle; voice_client drives it.
+def _task_overlap(a: str, b: str) -> float:
+    """Jaccard overlap of the content words of two task descriptions.
+
+    Deliberately crude: it only needs to catch the model re-delegating the same
+    job in slightly different words, not to understand the request.
+    """
+    stop = {"a", "an", "the", "and", "or", "to", "for", "of", "in", "with", "as",
+            "create", "make", "build", "me", "please", "very", "good", "can", "you"}
+    def words(t: str) -> set[str]:
+        return {w for w in "".join(
+            c if c.isalnum() or c.isspace() else " " for c in (t or "").lower()
+        ).split() if w not in stop and len(w) > 2}
+    wa, wb = words(a), words(b)
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+@dataclass
+class _BackgroundTask:
+    """One delegated agent_loop and everything needed to report on it."""
+
+    task_id: int
+    task: str
+    started: float
+    handle: Any = None  # asyncio.Task
+    state: str = "running"  # running|done|failed|cancelled
+    steps: Any = None  # deque of recent (kind, text) events
+    result: str | None = None
+    error: str | None = None
+    history: Any = None  # the worker's own message history, isolated from the foreground
+
+    @property
+    def elapsed_s(self) -> float:
+        return round(time.monotonic() - self.started, 1)
+
+    def summary(self) -> dict:
+        last = list(self.steps or [])[-1] if self.steps else None
+        return {
+            "task_id": self.task_id,
+            "state": self.state,
+            "elapsed_s": self.elapsed_s,
+            "step": f"{last[0]}: {last[1][:90]}" if last else None,
+            **({"result": self.result} if self.result else {}),
+            **({"error": self.error} if self.error else {}),
+        }
+
+
 class VoiceSession:
     """A persistent agent session: MCP tools open, one turn in flight, cancellable.
 
@@ -1541,8 +1686,16 @@ class VoiceSession:
         self.history: list[dict] = []  # replayed as user/assistant pairs across turns
         self._turn: asyncio.Task | None = None
         self.interrupted = False
+        # Delegated work. Keyed by id so the model can refer to a task by number
+        # in speech ("task one is still going"). Session-scoped and never
+        # persisted, for the same reason as _ALARMS: a task that outlived the
+        # process would report into nothing.
+        self.tasks: dict[int, _BackgroundTask] = {}
+        self._next_task_id = 1
 
     async def __aenter__(self) -> VoiceSession:
+        global _TASK_HOST
+        _TASK_HOST = self
         if not self.provider.model:
             self.provider.model = await self.provider.autodetect_model()
             self.provider.remember_model()
@@ -1552,7 +1705,12 @@ class VoiceSession:
         return self
 
     async def __aexit__(self, *exc) -> None:
+        global _TASK_HOST
         await self.cancel()
+        for task_id in list(self.tasks):
+            await self.cancel_background(task_id)
+        if _TASK_HOST is self:
+            _TASK_HOST = None
         await self.hub.close()
         await self.provider.close_client()
 
@@ -1582,10 +1740,123 @@ class VoiceSession:
         return answer
 
     def barge_in(self) -> None:
-        """Cancel the turn in flight. Safe to call from a VAD callback."""
+        """Cancel the turn in flight. Safe to call from a VAD callback.
+
+        Deliberately does NOT touch background tasks. Interrupting to ask a
+        question used to destroy a 60-second build, because the only way to be
+        heard was to cancel the loop doing the work. Stopping that work is now
+        an explicit `cancel_task`, which is also something the user can ask for
+        out loud.
+        """
         self.interrupted = True
         if self._turn is not None and not self._turn.done():
             self._turn.cancel()
+
+    # -- delegated work ----------------------------------------------------
+
+    #: Most concurrent background tasks. Each is a full LLM conversation, so
+    #: this is a spend ceiling as much as a resource one.
+    MAX_BACKGROUND = 2
+    #: Only near-verbatim re-delegation is deduplicated. A looser threshold was
+    #: tried and rejected: at 0.35, which was needed to catch the observed
+    #: rewording ("Create a polished Flappy Bird game as a single-page web app"
+    #: vs "Build a Flappy Bird clone web app", 0.44), bag-of-words overlap also
+    #: merged "build a snake game in javascript" with "build a tetris game in
+    #: javascript" (0.50) and "refactor the auth module" with "add tests to the
+    #: auth module" (0.40). Silently refusing a genuinely different request is
+    #: worse than one wasted task, so MAX_BACKGROUND is the real guard and this
+    #: only catches literal repeats.
+    DEDUPE_OVERLAP = 0.9
+
+    def start_background(self, task: str) -> dict:
+        """Spawn a detached agent_loop for a long task. Returns immediately.
+
+        Deduplicates against running work. Observed: one "build me a flappy bird
+        app" produced **three** tasks, because the foreground loop kept calling
+        start_task without knowing it had already delegated. Three concurrent
+        builds means triple the tokens and two abandoned at shutdown, so a
+        near-identical request returns the task already doing the job.
+        """
+        from collections import deque
+
+        running = [t for t in self.tasks.values() if t.state == "running"]
+        for t in running:
+            if _task_overlap(t.task, task) >= self.DEDUPE_OVERLAP:
+                return {"task_id": t.task_id, "state": "running", "deduplicated": True,
+                        "note": "a task for this is already running; check_task it"}
+        if len(running) >= self.MAX_BACKGROUND:
+            return {
+                "error": "E_TOO_MANY_TASKS",
+                "running": [t.task_id for t in running],
+                "hint": f"at most {self.MAX_BACKGROUND} background tasks; "
+                        "cancel_task one or wait for it",
+            }
+
+        task_id = self._next_task_id
+        self._next_task_id += 1
+        bg = _BackgroundTask(
+            task_id=task_id, task=task, started=time.monotonic(),
+            steps=deque(maxlen=24), history=[],
+        )
+
+        def on_event(kind: str, text: str) -> None:
+            if kind in ("tool", "status", "result"):
+                bg.steps.append((kind, text))
+            if self.on_event:  # keep the foreground UI informed too
+                self.on_event(kind, f"[task {task_id}] {text}")
+
+        # The worker gets voice off (it is not the one talking, and the voice
+        # prompt is what tells an agent to delegate) and background on, which
+        # strips the delegation tools. Without both, workers recurse.
+        worker_cfg = {**self.cfg, "voice": False, "background": True}
+
+        async def runner() -> None:
+            try:
+                bg.result = await agent_loop(
+                    task, worker_cfg, self.provider, on_event=on_event,
+                    session_history=bg.history, verbose=self.cfg.get("verbose"),
+                )
+                bg.state = "done"
+            except asyncio.CancelledError:
+                bg.state = "cancelled"
+                raise
+            except Exception as e:  # noqa: BLE001 — a failed task must be reportable
+                bg.state = "failed"
+                bg.error = f"{type(e).__name__}: {e}"
+                print(f"(background task {task_id} failed: {bg.error})")
+
+        bg.handle = asyncio.create_task(runner(), name=f"bg-task-{task_id}")
+        self.tasks[task_id] = bg
+        # Report what else is running: the observed triple-delegation happened
+        # because the loop had no way to know it had already started one.
+        others = [t.task_id for t in self.tasks.values()
+                  if t.state == "running" and t.task_id != task_id]
+        out: dict = {"task_id": task_id, "state": "running"}
+        if others:
+            out["also_running"] = others
+            out["note"] = "you already have work running; do not start it again"
+        return out
+
+    def background_status(self, task_id: int | None = None) -> dict:
+        """Status of one task, or all of them when task_id is omitted."""
+        if task_id is None:
+            return {"tasks": [t.summary() for t in self.tasks.values()]}
+        bg = self.tasks.get(task_id)
+        if bg is None:
+            return {"error": "E_NO_TASK", "task_id": task_id,
+                    "known": sorted(self.tasks)}
+        return bg.summary()
+
+    async def cancel_background(self, task_id: int) -> dict:
+        bg = self.tasks.get(task_id)
+        if bg is None:
+            return {"error": "E_NO_TASK", "task_id": task_id, "known": sorted(self.tasks)}
+        if bg.handle is not None and not bg.handle.done():
+            bg.handle.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await bg.handle
+            return {"cancelled": True, "task_id": task_id}
+        return {"cancelled": False, "task_id": task_id, "state": bg.state}
 
     async def cancel(self) -> None:
         """Cancel the live turn and wait for it to actually unwind."""

@@ -1,0 +1,198 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>voice agent</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --line:#262d36; --fg:#e6edf3; --dim:#8b949e;
+    --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --hot:#f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f8fa; --panel:#fff; --line:#d8dee4; --fg:#1f2328; --dim:#656d76; }
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif }
+  header { display:flex; align-items:center; gap:.75rem; padding:.9rem 1.1rem;
+           border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:2 }
+  h1 { font-size:1rem; margin:0; font-weight:600; letter-spacing:.01em }
+  #dot { width:9px; height:9px; border-radius:50%; background:var(--dim); flex:none }
+  #dot.listening { background:var(--ok); box-shadow:0 0 0 4px color-mix(in oklab,var(--ok) 25%,transparent) }
+  #dot.speaking  { background:var(--accent); box-shadow:0 0 0 4px color-mix(in oklab,var(--accent) 25%,transparent) }
+  #dot.thinking  { background:var(--warn) }
+  #dot.muted     { background:var(--hot) }
+  #status { color:var(--dim); font-variant-numeric:tabular-nums }
+  .spacer { flex:1 }
+  button { font:inherit; color:var(--fg); background:var(--panel); border:1px solid var(--line);
+           border-radius:7px; padding:.38rem .7rem; cursor:pointer }
+  button:hover { border-color:var(--accent) }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06121f; font-weight:600 }
+  button.danger  { border-color:var(--hot); color:var(--hot) }
+  main { display:grid; grid-template-columns:minmax(320px,1fr) minmax(300px,420px); gap:1rem; padding:1rem; align-items:start }
+  @media (max-width:860px){ main { grid-template-columns:1fr } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:.85rem 1rem; margin-bottom:1rem }
+  .card h2 { font-size:.72rem; text-transform:uppercase; letter-spacing:.09em; color:var(--dim);
+             margin:0 0 .6rem; font-weight:600 }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:.5rem }
+  .tile { border:1px solid var(--line); border-radius:8px; padding:.55rem .65rem }
+  .tile .k { color:var(--dim); font-size:.74rem }
+  .tile .v { font-size:1.05rem; font-weight:600; margin-top:.15rem }
+  .on  { color:var(--ok) } .off { color:var(--dim) }
+  .row { display:flex; justify-content:space-between; gap:.5rem; padding:.3rem 0;
+         border-bottom:1px dashed var(--line) }
+  .row:last-child { border-bottom:0 }
+  .muted { color:var(--dim) }
+  .empty { color:var(--dim); font-style:italic; padding:.2rem 0 }
+  #chat { max-height:46vh; overflow:auto; display:flex; flex-direction:column; gap:.5rem }
+  .msg { padding:.45rem .65rem; border-radius:9px; max-width:92%; white-space:pre-wrap; word-break:break-word }
+  .msg.user   { background:color-mix(in oklab,var(--accent) 16%,transparent); align-self:flex-end }
+  .msg.agent  { background:var(--bg); border:1px solid var(--line); align-self:flex-start }
+  .msg.system { color:var(--dim); font-size:.8rem; align-self:center; font-style:italic }
+  .msg .who { font-size:.68rem; color:var(--dim); display:block; margin-bottom:.1rem }
+  #partial { color:var(--dim); font-style:italic; min-height:1.2em; padding:0 .65rem }
+  form { display:flex; gap:.5rem; margin-top:.6rem }
+  input[type=text] { flex:1; font:inherit; color:var(--fg); background:var(--bg);
+                     border:1px solid var(--line); border-radius:7px; padding:.42rem .6rem }
+  #log { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.76rem;
+         max-height:190px; overflow:auto }
+  #log div { display:flex; gap:.5rem; padding:.1rem 0 }
+  #log .t { color:var(--dim) } #log .i { color:var(--accent); min-width:8.5em }
+  .btns { display:flex; flex-wrap:wrap; gap:.4rem }
+</style>
+
+<header>
+  <span id="dot"></span>
+  <h1>voice agent</h1>
+  <span id="status">connecting…</span>
+  <span class="spacer"></span>
+  <button id="mute">Mute mic</button>
+  <button id="interrupt" class="danger">Interrupt</button>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>Conversation</h2>
+      <div id="chat"></div>
+      <div id="partial"></div>
+      <form id="form">
+        <input id="text" type="text" placeholder="type a command — e.g. set a timer for 5 minutes" autocomplete="off">
+        <button class="primary">Send</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Activity</h2>
+      <div id="log"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>Lights</h2>
+      <div id="lights" class="grid"></div>
+      <div class="btns" style="margin-top:.6rem">
+        <button data-l="all/on">All on</button>
+        <button data-l="all/off">All off</button>
+        <button data-l="kitchen/on">Kitchen on</button>
+        <button data-l="bedroom/off">Bedroom off</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Timers &amp; alarms</h2>
+      <div id="timers"></div>
+      <div id="alarms"></div>
+    </div>
+    <div class="card">
+      <h2>Media</h2>
+      <div id="media"></div>
+      <div class="btns" style="margin-top:.6rem">
+        <button data-m="play">▶</button><button data-m="pause">⏸</button>
+        <button data-m="stop">⏹</button><button data-m="next">⏭</button>
+        <button data-m="volume_up">+</button><button data-m="volume_down">−</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Climate &amp; reminders</h2>
+      <div id="climate"></div>
+      <div id="reminders"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+let muted = false;
+
+function tile(k, v, cls = "") {
+  return `<div class="tile"><div class="k">${esc(k)}</div><div class="v ${cls}">${esc(v)}</div></div>`;
+}
+function rows(items, fn) {
+  return items.length ? items.map(fn).join("") : `<div class="empty">none</div>`;
+}
+
+function render(s) {
+  $("#dot").className = s.status || "";
+  $("#status").textContent = s.status || "idle";
+  $("#mute").textContent = muted ? "Unmute mic" : "Mute mic";
+
+  $("#lights").innerHTML = s.lights.length
+    ? s.lights.map(l => tile(
+        l.room,
+        (l.on ? "on" : "off") + (l.on && l.level != null ? ` · ${l.level}%` : "") + (l.color ? ` · ${l.color}` : ""),
+        l.on ? "on" : "off")).join("")
+    : `<div class="empty">no lights touched yet</div>`;
+
+  $("#timers").innerHTML = rows(s.timers, t =>
+    `<div class="row"><span>⏲ ${esc(t.label)}</span><span class="${t.done ? "muted" : ""}">${esc(t.remaining)}</span></div>`);
+  $("#alarms").innerHTML = rows(s.alarms, a =>
+    `<div class="row"><span>⏰ ${esc(a.time)}${a.label && a.label !== "alarm" ? " · " + esc(a.label) : ""}</span>
+     <span class="${a.enabled ? "on" : "muted"}">${a.enabled ? "on" : "off"}</span></div>`);
+
+  const m = s.media || {};
+  $("#media").innerHTML = tile("state", m.state || "stopped", m.state === "playing" ? "on" : "off")
+    + (m.track ? tile("track", m.track) : "");
+
+  const th = s.thermostat;
+  $("#climate").innerHTML = th
+    ? tile("thermostat", `${th.value}°${th.unit || ""}${th.room ? " · " + th.room : ""}`)
+    : `<div class="empty">thermostat not set</div>`;
+  $("#reminders").innerHTML = rows(s.reminders, r =>
+    `<div class="row"><span>📝 ${esc(r.text)}</span><span class="muted">${esc(r.time || "")}</span></div>`);
+
+  $("#log").innerHTML = rows(s.log || [], e =>
+    `<div><span class="t">${esc(e.ts)}</span><span class="i">${esc(e.intent)}</span><span>${esc(e.msg)}</span></div>`);
+
+  const chat = $("#chat"), atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
+  chat.innerHTML = (s.transcript || []).map(t =>
+    `<div class="msg ${esc(t.role)}"><span class="who">${esc(t.role)}${t.typed ? " · typed" : ""}</span>${esc(t.text)}</div>`).join("");
+  if (atBottom) chat.scrollTop = chat.scrollHeight;
+  $("#partial").textContent = s.partial || "";
+}
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = e => render(JSON.parse(e.data));
+  ws.onclose = () => { $("#status").textContent = "disconnected — retrying"; setTimeout(connect, 1500); };
+  ws.onerror = () => ws.close();
+}
+connect();
+
+const post = (url, body) => fetch(url, {
+  method: "POST", headers: {"Content-Type": "application/json"},
+  body: JSON.stringify(body || {}),
+});
+
+$("#form").onsubmit = e => {
+  e.preventDefault();
+  const t = $("#text").value.trim();
+  if (!t) return;
+  $("#text").value = "";
+  post("/api/say", {text: t});
+};
+$("#interrupt").onclick = () => post("/api/interrupt");
+$("#mute").onclick = () => { muted = !muted; post("/api/mute", {muted}); };
+document.querySelectorAll("[data-m]").forEach(b =>
+  b.onclick = () => post(`/api/media/${b.dataset.m}`));
+document.querySelectorAll("[data-l]").forEach(b =>
+  b.onclick = () => post(`/api/lights/${b.dataset.l}`));
+</script>

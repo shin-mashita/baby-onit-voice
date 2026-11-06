@@ -20,11 +20,21 @@ accepted; the server does not require a fixed size.
 ```jsonc
 {"type": "start",     "keyterms": ["flappy bird"], "context": null}
 {"type": "reset"}      // drop the in-flight utterance, keep the socket
+{"type": "finalize"}   // the utterance ended; emit a transcript for what you have
 {"type": "stop"}       // close the stream cleanly
 ```
 
 `keyterms` is applied via `Transcriber.set_keyterms()`. Required in practice:
-without it "flappy" transcribes as "floppy" / "flashlight" (measured).
+without it "flappy" transcribes as "floppy" / "flashlight" (measured) — and note
+it needs `keyterm_boost >= 5.0` at load time or it is silently inert. Qwen3-ASR
+exposes no keyterm biasing and logs that it is ignoring the terms.
+
+`finalize` exists because the engine may not know when the human stopped. A
+frame-streaming engine (Moonshine) segments internally and ignores it. A
+non-streaming engine (Qwen3-ASR, an encoder feeding an autoregressive decoder)
+has no per-frame emission, so `finalize` is the **only** thing that makes it
+produce a transcript, and such an engine emits **no `partial` events at all**.
+The client's VAD owns the turn boundary either way, so it always sends it.
 
 ### Server → client — text (JSON), one object per line
 
@@ -36,6 +46,11 @@ without it "flappy" transcribes as "floppy" / "flashlight" (measured).
 ```
 
 `t` is seconds since `start`.
+
+`no_speech` says the server examined a finalized buffer and found nothing worth
+transcribing. It exists so a client does not wait out its transcript timeout on
+a turn that was never going to produce text — a silent drop is indistinguishable
+from a slow backend. Only non-streaming engines emit it.
 
 > **`line` is NOT a turn boundary.** One 6.6 s utterance emitted two `line`
 > events (measured — see `ARCHITECTURE.md` §5.1). The client accumulates lines

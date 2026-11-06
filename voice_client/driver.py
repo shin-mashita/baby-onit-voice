@@ -25,7 +25,7 @@ import numpy as np
 
 from .config import load as load_config
 from .player import AudioPlayer
-from .turn import TurnDetector
+from .turn import FRAME_MS, TurnDetector
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +46,8 @@ class VoiceDriver:
             barge_in_ms=self.cfg["turn"]["barge_in_ms"],
             on_turn_end=self._on_turn_end,
             on_barge_in=self._on_barge_in,
+            hesitation_extra_ms=self.cfg["turn"].get("hesitation_extra_ms", 0),
+            peek_text=self._live_text,
         )
         self.capture = None
         self._asr = None
@@ -55,7 +57,14 @@ class VoiceDriver:
         # Mic frames held while the agent speaks; see _on_mic_frame. Sized to
         # barge_in_ms plus a margin, so the interrupting words survive the gate.
         self._parked: list[np.ndarray] = []
-        self._park_max = max(16, 2 * self.turns.barge_in_frames)
+        # Sized in seconds, not in barge-in frames: at 2x barge_in_frames it
+        # held 0.58 s, which silently truncated every interruption.
+        self._park_max = max(16, round(
+            self.cfg["turn"].get("park_ring_s", 3.0) * 1000 / FRAME_MS
+        ))
+        # True once the human speaks over the agent; stops parking until the
+        # resulting turn resolves.
+        self._speech_over_playback = False
         # How long to wait for ASR text after the VAD says the turn ended, and
         # how long to let a trailing line settle. Sized off MEDIUM_STREAMING's
         # post-reset first-partial latency (~3.7s measured); a smaller model
@@ -69,6 +78,20 @@ class VoiceDriver:
         # discarded rather than replayed -- see _on_barge_in.
         self._generation = 0
         self._resolver: asyncio.Task | None = None
+        # Set by barge-in, cleared by the next speak(). While set, inbound PCM
+        # is discarded rather than queued -- see _pump_audio.
+        self._audio_muted = False
+        # Set by a `no_speech` event; lets _resolve_turn stop waiting at once.
+        self._no_speech = False
+        t = self.cfg["turn"]
+        self.continuation_s = t.get("continuation_ms", 0) / 1000
+        self.filler_delay_s = t.get("filler_delay_ms", 0) / 1000
+        # When the last turn was handed to the queue, and what it said. Speech
+        # resuming inside continuation_s -- before the agent has made a sound --
+        # withdraws it and carries the text into the next turn.
+        self._dispatched_at: float = 0.0
+        self._carry = ""
+        self._last_text = ""
         # Append-only record of what the conversation actually did. A voice
         # session leaves no scrollback worth reading -- the terminal shows log
         # lines, not the dialogue -- so without this an "it went wrong" report
@@ -139,20 +162,63 @@ class VoiceDriver:
 
     # ------------------------------------------------------------------- audio
 
+    def _live_text(self) -> str:
+        """The transcript so far, for the turn detector's hesitation check."""
+        return (" ".join(self.transcript) + " " + self.partial).strip()
+
+    def _maybe_withdraw(self) -> None:
+        """Speech resumed right after a turn was dispatched: take it back.
+
+        A hard silence threshold will sometimes fire mid-thought no matter how
+        it is tuned. Rather than make the threshold perfect, make being wrong
+        survivable: if the human carries on before the agent has said anything,
+        the turn is withdrawn and its words are prepended to the next one.
+        """
+        if not self._carry_window_open():
+            return
+        age_ms = (asyncio.get_running_loop().time() - self._dispatched_at) * 1000
+        text, self._dispatched_at = self._last_text, 0.0
+        self._generation += 1
+        self._audio_muted = True
+        self.player.flush()
+        stale = self._drain_pending()
+        self._carry = f"{self._carry} {text}".strip() if self._carry else text
+        log.info("withdrew turn (gen %d) %.0fms after dispatch; carrying %r",
+                 self._generation, age_ms, self._carry[:60])
+        self._record("turn_withdrawn", text=text, discarded_turns=stale)
+        self.session.barge_in()
+
+    def _carry_window_open(self) -> bool:
+        if not self._dispatched_at or self.continuation_s <= 0:
+            return False
+        if self.player.is_playing:
+            return False  # the agent is already audible; that is a barge-in
+        return (asyncio.get_running_loop().time() - self._dispatched_at) < self.continuation_s
+
     def _on_mic_frame(self, frame: np.ndarray, is_speech: bool) -> None:
         """One 512-sample mic frame, already VAD-scored. Runs on the event loop."""
+        if is_speech and self._carry_window_open():
+            self._maybe_withdraw()
         speaking = self.player.is_playing
         self.turns.agent_speaking = speaking
         self.turns.feed(is_speech)
         if self._asr is None:
             return
-        if speaking:
-            # ASR and TTS contend hard for memory bandwidth: concurrent ASR
-            # ingest pushes TTS time-to-first-audio from ~500 ms to ~2300 ms
-            # (measured, 4.3x). Nothing needs transcription while the agent
-            # talks -- barge-in runs off the local VAD, not off ASR -- so the
-            # mic is parked here and the cores go to synthesis. Frames are kept
-            # in a short ring so a barge-in does not lose its opening syllables.
+        if speaking and is_speech:
+            # The human has started talking over the agent. Everything from here
+            # must reach ASR: parking it was costing entire questions. The ring
+            # only ever held 0.58 s, so a three-second question arrived as its
+            # last half second -- or, if they finished while audio was still
+            # playing, as nothing at all, and the turn was dropped with no
+            # transcript. Observed repeatedly in live use.
+            self._speech_over_playback = True
+        if speaking and not self._speech_over_playback:
+            # Still just the agent talking. ASR and TTS contend for memory
+            # bandwidth (measured 4.3x on CPU TTS, 1.54x on GPU), and nothing
+            # needs transcribing while only the agent is speaking, so the mic is
+            # parked and the cores go to synthesis. The ring keeps the frames
+            # immediately before speech is detected, since the VAD needs a few
+            # frames to be sure and those carry the opening syllables.
             self._parked.append(frame)
             if len(self._parked) > self._park_max:
                 self._parked.pop(0)
@@ -169,6 +235,12 @@ class VoiceDriver:
             asyncio.create_task(self._reset_then_send(b"".join(f.tobytes() for f in parked)))
         # float32 LE PCM, exactly as VOICE_PROTOCOL §1 specifies.
         asyncio.create_task(self._send_audio(frame.tobytes()))
+
+    async def _send_finalize(self) -> None:
+        try:
+            await self._asr.send(json.dumps({"type": "finalize"}))
+        except Exception as e:  # noqa: BLE001 — a lost finalize costs one turn, not the session
+            log.warning("asr finalize failed: %s", e)
 
     async def _reset_then_send(self, payload: bytes) -> None:
         """Clear the ASR stream across an unpark gap, then replay the parked burst."""
@@ -199,6 +271,12 @@ class VoiceDriver:
                 self.partial = ""
                 if ev.get("text"):
                     self.transcript.append(ev["text"])
+            elif kind == "no_speech":
+                # The server looked at the buffer and found nothing worth
+                # transcribing. End the wait now instead of timing out.
+                log.info("asr: no speech in %.2fs (rms %.5f); abandoning turn",
+                         ev.get("seconds", 0), ev.get("rms", 0))
+                self._no_speech = True
             elif kind == "error":
                 log.error("asr: %s", ev.get("message"))
 
@@ -206,6 +284,14 @@ class VoiceDriver:
         """Unframe PCM from the TTS data plane into the speaker queue."""
         async for msg in self._audio:
             if not isinstance(msg, (bytes, bytearray)) or len(msg) < _HEADER.size:
+                continue
+            if self._audio_muted:
+                # Barge-in flushed the player, but frames already in flight --
+                # or still being pushed -- would refill it and the agent would
+                # audibly resume. On GPU the server delivers a whole reply at
+                # ~17x realtime, so that race is the common case, not a corner.
+                # Everything arriving now belongs to the interrupted utterance;
+                # drop it until speak() deliberately starts a new one.
                 continue
             uid, rate, n, is_final = _HEADER.unpack_from(msg, 0)
             samples = np.frombuffer(msg, dtype="<f4", count=n, offset=_HEADER.size)
@@ -219,6 +305,11 @@ class VoiceDriver:
     def _on_turn_end(self) -> None:
         """VAD says the human stopped. Promote the transcript into a turn.
 
+        Also tells the server the utterance ended. A streaming engine segments
+        on its own and ignores it; a non-streaming one (Qwen3-ASR) has no
+        frame-level emission and this is the only signal that makes it produce
+        a transcript at all.
+
         At most one resolver runs at a time: two of them race on the same
         `transcript`/`partial` and can dispatch overlapping text for a single
         utterance, which reads as the agent answering twice.
@@ -229,6 +320,8 @@ class VoiceDriver:
         transcript synchronously here drops any utterance whose text has not
         landed yet: the user speaks and is silently ignored. So wait for it.
         """
+        if self._asr is not None:
+            asyncio.create_task(self._send_finalize())
         if self._resolver is not None and not self._resolver.done():
             self._resolver.cancel()
         self._resolver = asyncio.create_task(self._resolve_turn(self._generation))
@@ -241,14 +334,20 @@ class VoiceDriver:
         speech the user has already superseded, so it is dropped rather than
         queued behind the interruption.
         """
+        self._no_speech = False
         deadline = asyncio.get_running_loop().time() + self.transcript_grace_s
         while not (self.transcript or self.partial.strip()):
+            if self._no_speech:
+                self._record("no_speech")
+                return  # already logged by _pump_asr; not a timeout
             if asyncio.get_running_loop().time() > deadline:
                 log.warning(
-                    "turn dropped: no transcript within %.1fs of end-of-speech "
-                    "(ASR may be lagging; consider a smaller --model-arch)",
+                    "turn dropped: no transcript within %.1fs of end-of-speech. "
+                    "The ASR accepted the audio but never returned text -- check "
+                    "the speech_server log for an error or a slow backend.",
                     self.transcript_grace_s,
                 )
+                self._record("turn_dropped", reason="transcript_timeout")
                 return
             await asyncio.sleep(0.05)
         # Give a trailing line a moment to replace a mid-word partial, so the
@@ -269,12 +368,18 @@ class VoiceDriver:
         text = " ".join(self.transcript).strip() or self.partial.strip()
         self.transcript.clear()
         self.partial = ""
+        self._speech_over_playback = False
         if gen != self._generation:
             log.info("discarding superseded utterance (gen %d != %d): %r",
                      gen, self._generation, text[:60])
             self._record("discarded_utterance", gen_at_capture=gen, text=text)
             return
+        if self._carry:
+            text = f"{self._carry} {text}".strip()
+            self._carry = ""
         if text:
+            self._last_text = text
+            self._dispatched_at = asyncio.get_running_loop().time()
             self._pending_turn.put_nowait(text)
 
     def _on_barge_in(self) -> None:
@@ -288,6 +393,7 @@ class VoiceDriver:
         invalidates the whole generation, and everything below checks it.
         """
         self._generation += 1
+        self._audio_muted = True  # before the flush, so nothing slips in between
         dropped = self.player.flush()
         stale = self._drain_pending()
         log.info(
@@ -344,6 +450,13 @@ class VoiceDriver:
         # this a new filler plays *behind* a stale answer and the two arrive in
         # the wrong order.
         await self._clear_stale_speech()
+        if self.filler_delay_s:
+            # Hold briefly: if the human was mid-thought and carries on, the
+            # withdrawal lands in this gap and nothing is ever heard.
+            await asyncio.sleep(self.filler_delay_s)
+            if gen != self._generation:
+                log.info("turn (gen %d) withdrawn during the filler delay", gen)
+                return None
         await self.speak_filler()
         answer = await self.session.ask(text)
         if answer is None or gen != self._generation:
@@ -372,6 +485,8 @@ class VoiceDriver:
 
     async def speak(self, text: str) -> None:
         """Say something through the TTS control plane, best-effort."""
+        # A deliberate new utterance ends the post-barge-in mute.
+        self._audio_muted = False
         if "speak" not in _tools(self.session):
             log.warning("no `speak` tool registered; answer will not be spoken")
             return

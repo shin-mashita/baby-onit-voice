@@ -8,4 +8,5 @@ local_search/
 __pycache__/
 tmp
 .venv/
+.venv-qwen/
 voice.yaml

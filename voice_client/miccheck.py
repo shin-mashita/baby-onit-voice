@@ -93,12 +93,68 @@ def transcribe(audio: np.ndarray, arch_name: str, keyterms: list[str]) -> str:
     return norm(" ".join(lines)), time.perf_counter() - t0
 
 
+def transcribe_qwen(audio: np.ndarray, base_url: str) -> tuple[str, float]:
+    """POST the audio to a vLLM /v1/audio/transcriptions endpoint.
+
+    Qwen has no frame-level emission, so this is one request for the whole
+    utterance -- there are no partials to compare against Moonshine's.
+    """
+    import io
+    import wave
+
+    import urllib.request
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes((np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes())
+    wav = buf.getvalue()
+
+    boundary = "----miccheck"
+    parts = []
+    for field, value in (("model", "qwen3-asr"),):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n".encode()
+        )
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+        f"filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode() + wav + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/audio/transcriptions",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            import json
+
+            text = json.load(r).get("text", "")
+    except Exception as e:  # noqa: BLE001 — a dead server must not hide the Moonshine rows
+        return f"<qwen unreachable: {type(e).__name__}>", time.perf_counter() - t0
+    return norm(text), time.perf_counter() - t0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m voice_client.miccheck", description=__doc__)
     ap.add_argument("reference", nargs="*", help="what you intend to say (for WER)")
     ap.add_argument("--seconds", type=float, default=6.0)
     ap.add_argument("--keyterms", nargs="*", default=["flappy bird", "web game"])
     ap.add_argument("--device", default=None, help="input device (default: system default)")
+    ap.add_argument(
+        "--qwen",
+        nargs="?",
+        const="http://127.0.0.1:8773/v1",
+        default=None,
+        metavar="URL",
+        help="also transcribe with Qwen3-ASR served at URL (needs scripts_qwen_serve.sh)",
+    )
     ap.add_argument("--save", help="write the recording to this wav for re-testing")
     ap.add_argument("--wav", help="re-test a saved wav instead of recording")
     ap.add_argument("--gain", type=float, default=1.0, help="scale the audio before transcribing")
@@ -146,6 +202,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name:18} {compute/dur:6.3f} {w}")
         except Exception as e:  # noqa: BLE001 — one bad model must not hide the rest
             print(f"{name:18} ERROR {type(e).__name__}: {str(e)[:40]}")
+    if args.qwen:
+        hyp, elapsed = transcribe_qwen(audio, args.qwen)
+        hyps["Qwen3-ASR (GPU)"] = hyp
+        w = f"{wer(ref, hyp)*100:7.1f}%" if ref else "      -"
+        print(f"{'Qwen3-ASR (GPU)':18} {elapsed/dur:6.3f} {w}")
+
     print()
     for name, hyp in hyps.items():
         print(f"{name}:\n  {hyp}")

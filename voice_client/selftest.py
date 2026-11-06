@@ -238,8 +238,207 @@ def test_ordering() -> None:
     asyncio.run(run())
 
 
+def test_audio_mute_after_barge_in() -> None:
+    """Audio arriving after a barge-in must be dropped, not queued.
+
+    The player flush empties the queue, but frames already in flight refill it
+    and the agent audibly resumes. On GPU the server delivers a whole reply at
+    ~17x realtime, so this race is the common case rather than a corner.
+    """
+    print("\n[6] barge-in mutes inbound audio until the next deliberate speak")
+
+    import struct
+
+    import numpy as np
+
+    from .driver import _HEADER, VoiceDriver
+
+    class Stub:
+        async def ask(self, *a, **k): return "done"
+        def barge_in(self): ...
+
+    cfg = {
+        "asr": {"url": "", "keyterms": []},
+        "tts": {"mcp_url": "", "audio_url": ""},
+        "turn": {"silence_ms": 700, "barge_in_ms": 300, "vad_threshold": 0.5,
+                 "transcript_grace_ms": 2000, "line_settle_ms": 100},
+        "audio": {"input_device": None, "output_device": None, "aec": True},
+        "filler": {"enabled": False, "phrases": []},
+        "transcript_log": None,
+    }
+
+    async def run() -> None:
+        d = VoiceDriver(Stub(), cfg, mic=False)
+        frame = _HEADER.pack(1, 24000, 480, 0) + np.zeros(480, dtype="<f4").tobytes()
+
+        def feed(msg: bytes) -> None:
+            """What _pump_audio does with one frame, minus the socket."""
+            if d._audio_muted:
+                return
+            uid, rate, n, final = _HEADER.unpack_from(msg, 0)
+            d.player.enqueue(np.frombuffer(msg, dtype="<f4", count=n, offset=_HEADER.size), uid)
+
+        feed(frame)
+        check(d.player.pending_seconds > 0, "audio queues normally before a barge-in")
+
+        d._on_barge_in()
+        check(d.player.pending_seconds == 0, "barge-in empties the player")
+        check(d._audio_muted, "barge-in sets the audio mute")
+
+        feed(frame)  # a frame that was already in flight
+        check(d.player.pending_seconds == 0,
+              "a frame arriving after barge-in is dropped, not queued")
+
+        d._audio_muted = False  # what speak() does
+        feed(frame)
+        check(d.player.pending_seconds > 0, "a deliberate new utterance un-mutes")
+
+    asyncio.run(run())
+
+
+def test_hesitation_endpointing() -> None:
+    """A thinking pause must not end the turn."""
+    print("\n[7] a thinking pause extends the silence window")
+
+    from .turn import ends_in_hesitation
+
+    for text, expect in (
+        ("Umam, I think.", True),          # what Qwen returns for "uhmm I think"
+        ("so", True),
+        ("I need", True),
+        ("I want a good Flappy Bird app.", False),
+        ("What is the weather today?", False),
+    ):
+        got = ends_in_hesitation(text)
+        check(got == expect, f"{text!r} -> {'pause' if got else 'complete'}")
+
+    # The window actually widens, and only while the tail looks unfinished.
+    live = {"text": "umm I think"}
+    ends = []
+    d = TurnDetector(silence_ms=700, hesitation_extra_ms=500,
+                     on_turn_end=lambda: ends.append(1),
+                     peek_text=lambda: live["text"])
+    for _ in range(frames(500)):
+        d.feed(True)
+    for _ in range(frames(800)):          # longer than 700, shorter than 1200
+        d.feed(False)
+    check(not ends, "800ms of silence does not end a turn that trails off")
+    live["text"] = "umm I think I want a flappy bird app"
+    for _ in range(frames(500)):          # now past 1200ms total
+        d.feed(False)
+    check(len(ends) == 1, f"it ends once the tail is complete (got {len(ends)})")
+
+
+def test_continuation_merge() -> None:
+    """A withdrawn turn carries its words into the next one."""
+    print("\n[8] speech resuming just after dispatch withdraws and merges")
+
+    from .driver import VoiceDriver
+
+    class Stub:
+        def __init__(self): self.barges = 0
+        async def ask(self, *a, **k): return "done"
+        def barge_in(self): self.barges += 1
+
+    cfg = {
+        "asr": {"url": "", "keyterms": []},
+        "tts": {"mcp_url": "", "audio_url": ""},
+        "turn": {"silence_ms": 900, "barge_in_ms": 300, "vad_threshold": 0.5,
+                 "transcript_grace_ms": 2000, "line_settle_ms": 100,
+                 "continuation_ms": 700, "filler_delay_ms": 250,
+                 "hesitation_extra_ms": 500},
+        "audio": {"input_device": None, "output_device": None, "aec": True},
+        "filler": {"enabled": False, "phrases": []},
+        "transcript_log": None,
+    }
+
+    async def run() -> None:
+        stub = Stub()
+        d = VoiceDriver(stub, cfg, mic=False)
+
+        d.transcript, d.partial = ["umm I think"], ""
+        d._on_turn_end()
+        first = await asyncio.wait_for(d._pending_turn.get(), 4)
+        check(first == "umm I think", f"the premature turn is dispatched ({first!r})")
+        check(d._carry_window_open(), "the withdrawal window is open right after dispatch")
+
+        d._maybe_withdraw()
+        check(d._carry == "umm I think", f"its text is carried ({d._carry!r})")
+        check(stub.barges == 1, "the in-flight turn is cancelled")
+
+        d.transcript, d.partial = ["I want a flappy bird app"], ""
+        d._on_turn_end()
+        merged = await asyncio.wait_for(d._pending_turn.get(), 4)
+        check(merged == "umm I think I want a flappy bird app",
+              f"the next turn is the merged sentence ({merged!r})")
+        check(d._carry == "", "the carry is consumed, not repeated")
+
+        # And a genuine new utterance long after must NOT merge.
+        d._dispatched_at = 0.0
+        check(not d._carry_window_open(), "the window closes once it lapses")
+
+    asyncio.run(run())
+
+
+def test_speech_over_playback_reaches_asr() -> None:
+    """Speech over the agent must be forwarded, not parked into a 0.58s ring."""
+    print("\n[9] talking over the agent forwards audio instead of discarding it")
+
+    import numpy as np
+
+    from .driver import VoiceDriver
+
+    class Stub:
+        async def ask(self, *a, **k): return "done"
+        def barge_in(self): ...
+
+    cfg = {
+        "asr": {"url": "", "keyterms": []},
+        "tts": {"mcp_url": "", "audio_url": ""},
+        "turn": {"silence_ms": 900, "barge_in_ms": 300, "vad_threshold": 0.5,
+                 "transcript_grace_ms": 2000, "line_settle_ms": 100,
+                 "continuation_ms": 700, "filler_delay_ms": 250,
+                 "hesitation_extra_ms": 500, "park_ring_s": 3.0},
+        "audio": {"input_device": None, "output_device": None, "aec": True},
+        "filler": {"enabled": False, "phrases": []},
+        "transcript_log": None,
+    }
+
+    async def run() -> None:
+        d = VoiceDriver(Stub(), cfg, mic=False)
+        check(d._park_max * FRAME_MS / 1000 >= 2.5,
+              f"the park ring holds >=2.5s (got {d._park_max * FRAME_MS / 1000:.2f}s)")
+
+        sent: list[int] = []
+        d._send_audio = lambda payload: _count(sent, payload)
+        d._reset_then_send = lambda payload: _count(sent, payload)
+        d._asr = object()
+        frame = np.zeros(512, dtype=np.float32)
+
+        # The agent is talking and the human is silent: park, send nothing.
+        d.player.enqueue(np.zeros(24000, dtype=np.float32))
+        for _ in range(20):
+            d._on_mic_frame(frame, False)
+        check(not sent, f"agent-only audio is parked, not sent (sent {len(sent)})")
+        check(len(d._parked) == 20, f"and is retained ({len(d._parked)} frames)")
+
+        # The human starts talking over it: every frame from here must go.
+        for _ in range(30):
+            d._on_mic_frame(frame, True)
+        await asyncio.sleep(0.05)
+        check(len(sent) >= 30,
+              f"speech over playback is forwarded ({len(sent)} sends for 30 frames)")
+
+    def _count(acc, payload):
+        acc.append(len(payload))
+        async def _noop(): return None
+        return _noop()
+
+    asyncio.run(run())
+
+
 def test_frame_header() -> None:
-    print("\n[6] audio frame header matches the protocol")
+    print("\n[10] audio frame header matches the protocol")
 
     from .driver import _HEADER
 
@@ -251,7 +450,9 @@ def test_frame_header() -> None:
 
 def main() -> int:
     for t in (test_turn_detector, test_barge_in, test_vad,
-              test_transcript_grace, test_ordering, test_frame_header):
+              test_transcript_grace, test_ordering, test_audio_mute_after_barge_in,
+              test_hesitation_endpointing, test_continuation_merge,
+              test_speech_over_playback_reaches_asr, test_frame_header):
         t()
     print(f"\n{PASS}/{PASS + FAIL} checks passed")
     return 1 if FAIL else 0

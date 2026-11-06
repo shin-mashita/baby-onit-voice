@@ -46,10 +46,33 @@ async def run(args) -> int:
             if args.say:
                 answer = await driver.handle_turn(" ".join(args.say))
                 print(answer or "(cancelled)")
+                # One-shot mode would otherwise exit straight into __aexit__,
+                # which cancels background tasks -- so a delegated build would
+                # never finish and --say could not test one at all.
+                await _await_background(session, args.wait_tasks)
                 return 0
             print("listening — speak, or Ctrl-C to quit", file=sys.stderr)
             await asyncio.Event().wait()  # driven entirely by mic events
     return 0
+
+
+async def _await_background(session, timeout: float) -> None:
+    """Let delegated tasks finish before a one-shot run tears the session down."""
+    if timeout <= 0 or not getattr(session, "tasks", None):
+        return
+    pending = [t for t in session.tasks.values() if t.state == "running"]
+    if not pending:
+        return
+    log.info("waiting up to %.0fs for %d background task(s)", timeout, len(pending))
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        running = [t for t in session.tasks.values() if t.state == "running"]
+        if not running:
+            break
+        await asyncio.sleep(1.0)
+    for t in session.tasks.values():
+        log.info("task %d: %s%s", t.task_id, t.state,
+                 f" -- {t.error}" if t.error else "")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -59,6 +82,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--data-path", help="agent working directory")
     ap.add_argument("--no-mic", action="store_true", help="skip mic capture (for --say)")
     ap.add_argument("--say", nargs="+", help="run one typed turn instead of listening")
+    ap.add_argument(
+        "--wait-tasks",
+        type=float,
+        default=300.0,
+        help="with --say, seconds to wait for delegated background tasks (0 to skip)",
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(

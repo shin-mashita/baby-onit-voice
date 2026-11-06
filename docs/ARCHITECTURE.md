@@ -22,7 +22,7 @@ hosts the ASR and TTS endpoints; the LLM is reached through a **Portkey** gatewa
 | Orchestration + VAD | Raspberry Pi 5 | User requirement; the Pi stays light |
 | ASR + TTS | Laptop, over the network | Keeps heavy inference off the Pi |
 | ASR engine | Moonshine **Streaming v2** | Genuinely frame-streaming; partials arrive mid-utterance |
-| TTS engine | Moonshine TTS (CPU). `kokoro-onnx` implemented but **unusable here** | This machine's GPU cannot initialize CUDA — see below |
+| TTS engine | **`kokoro-onnx` on CUDA**, Moonshine TTS as fallback | 5x faster than CPU in ~620 MiB of VRAM, and it frees the cores ASR needs |
 | LLM brain | Portkey (OpenAI-compatible) | Provider-agnostic; no local VRAM cost |
 | Agent harness | baby-onit on branch `feature/voice-agent` | Small, single-file, easy to patch |
 
@@ -63,7 +63,32 @@ Moonshine's pipeline *with* a Kokoro voice (`kokoro_af_heart`).
 > `--tts-backend auto` falls back to Moonshine when CUDA or kokoro-onnx is
 > unavailable.
 >
-> **The GPU path is implemented but does not work on this machine.**
+> **Resolved 2026-11-06: a reboot fixed CUDA and the GPU path now works.**
+> `cudaGetDeviceCount` returns `rc=0, devices=1`, confirming the diagnosis below
+> was the card's state rather than the software. Measured on CUDA:
+>
+> | | CPU | **CUDA** |
+> |---|---|---|
+> | Kokoro RTF | 0.25 | **0.047** |
+> | TTS time-to-first-audio, ASR idle | ~500 ms | **138 ms** |
+> | TTS time-to-first-audio, ASR ingesting | ~2350 ms | **212 ms** |
+> | ASR/TTS contention | 4.3x | **1.54x** |
+> | VRAM | — | 620 MiB |
+>
+> Moving synthesis off the CPU largely dissolves the contention in §5.11 at its
+> source, because the 14 cores a CPU synthesis consumed are no longer taken. The
+> mic-parking mitigation is retained — it still removes the residual 1.54x — but
+> it is no longer load-bearing.
+>
+> **One trap worth keeping:** onnxruntime-gpu does not add the pip `nvidia/*/lib`
+> wheel directories to the loader path, and `LD_LIBRARY_PATH` is read only at
+> process start, so it cannot be fixed from inside the process. Without a manual
+> `ctypes.CDLL(..., RTLD_GLOBAL)` preload of those libraries the CUDA provider
+> fails with `libcublasLt.so.12: cannot open shared object file`, silently falls
+> back to CPU, and synthesizes anyway. `KokoroOnnxTts._preload_cuda_libs()` does
+> the preload; `provider` reports what actually won.
+>
+> The original diagnosis, kept because it is how the fault was isolated:
 > `KokoroOnnxTts` is complete and correct, and selectable with
 > `--tts-backend kokoro`. It currently runs on CPU, where it is *slower* than
 > Moonshine (746 ms vs ~500 ms TTFA), so **the default stays `moonshine`**.
@@ -594,6 +619,69 @@ This is also the strongest argument for keeping the speech models **off** the
 Raspberry Pi. A workload that wants ~14 cores for one synthesis has no business
 on 4 Cortex-A76s; the split topology is not just convenient, it is required.
 
+### 5.11.1 GPU synthesis outruns the client, and that moves barge-in
+
+A side effect of moving TTS to CUDA: synthesis now delivers audio at **17x
+realtime** (measured: 53.7 s of speech pushed in 3.19 s), so the client holds the
+entire reply before a user could plausibly interrupt it.
+
+Consequences, in order of importance:
+
+* **Audible barge-in still works, and is now purely local.** The client flush
+  takes 0.05 ms and silences 50.7 s of queued audio instantly.
+* **Server-side `stop_speaking` has become vestigial** for replies of ordinary
+  length -- it returns `{"stopped": false}` because synthesis already finished.
+  It is still correct, just rarely the thing doing the work.
+* **The client buffers an unbounded reply** (~4.9 MB for 50 s). Harmless on a
+  laptop over loopback; worth bounding before the Pi deployment, where that is
+  5 MB crossing the LAN per reply, most of it discarded on any interruption.
+
+Pacing synthesis to ~2x realtime would bound the buffer and keep server-side
+cancellation meaningful. Not done: it trades a real latency win for a
+theoretical memory one, and the audible behaviour is correct as-is.
+
+`speech_server/selftest.py` asserts truncation server-side, so two of its checks
+now fail against a GPU backend. **The assertions are stale, not the behaviour** --
+they predate synthesis being faster than delivery.
+
+### 5.11.2 Barge-in must mute the audio socket, not just flush the player
+
+Reported from live use as "significant lag when trying to interrupt". The
+player flush is instant (0.05 ms), but `_pump_audio` enqueued **every** inbound
+frame unconditionally — so frames already in flight refilled the queue and the
+agent audibly resumed a moment after being cut off. With GPU synthesis pushing a
+whole reply at ~17x realtime (§5.11.1) that race is the normal case, not a
+corner.
+
+Fix: `_audio_muted`, set before the flush and cleared only by the next
+deliberate `speak()`. While set, inbound PCM is discarded. Everything arriving
+after an interruption belongs to the utterance that was interrupted.
+
+**Interruption does not depend on streaming ASR.** Barge-in is decided by the
+local Silero VAD and never consults the transcript, so a non-streaming ASR
+(Qwen) is not why it felt unresponsive.
+
+### 5.11.3 Qwen hallucinates on near-silence
+
+Reported as "Chinese letters" appearing as turns. Reproduced: 2 s of noise at
+the measured idle floor returns `"¿Qué?"` with no language set. **Forcing
+`language=en` does not fix it** — it returns `"Okay."` instead, i.e. the
+language parameter changes which language is invented, not whether.
+
+Two independent guards:
+
+1. **The client VAD**, which is the real defence: measured, Silero scores 0
+   speech frames out of 93 on white noise at every level from rms 0.003 to
+   0.0997, so no turn is dispatched on noise at all.
+2. **A server-side RMS gate** (`MIN_SPEECH_RMS = 0.015`) for buffers that are
+   mostly silence even though the VAD saw speech — a short utterance where the
+   parked-mic gap dominates, for instance. Idle floor is ~0.003 and real speech
+   ~0.12, so the threshold is an order of magnitude clear of both.
+
+Also note the endpoint accepts **`language` and `hotwords`** even though the
+model card documents neither, so Qwen does support keyterm biasing after all
+and the client's terms are now forwarded.
+
 ### 5.12 Diagnosability: keep a transcript
 
 A voice session leaves no scrollback worth reading — the terminal shows log
@@ -644,6 +732,80 @@ which is what makes an ordering complaint diagnosable at all:
     record added latency.
 
 ---
+
+## 7. Qwen3-ASR — an alternative ASR engine, measured
+
+Optional, and off by default. Moonshine stays the default because it is
+genuinely frame-streaming and needs no second process; this section records
+why Qwen exists as an option and exactly what it costs, since none of that was
+written down anywhere until now.
+
+### 7.1 Why it is a different shape, not just a different model
+
+Qwen3-ASR is an audio encoder feeding an autoregressive LLM decoder, not a
+transducer. A transducer (Moonshine, RNN-T) emits output as encoder frames
+arrive -- the encoder runs ahead of the speaker. An encoder+LLM has no
+per-frame emission: the decoder runs a generation pass over whatever audio has
+accumulated, so emission is tied to chunk boundaries by construction. This is
+why Qwen cannot produce partial transcripts no matter how it is served, and why
+the protocol needed a new message (`finalize`, VOICE_PROTOCOL.md §1) to tell it
+when an utterance has ended -- it has no internal notion of that at all.
+
+### 7.2 Measured, on a real recording of the user (not synthesized audio)
+
+| | Moonshine MEDIUM | Qwen3-ASR-1.7B |
+|---|---|---|
+| WER | 0.0% | 0.0% |
+| RTF | 0.868 (CPU) | 0.109 (GPU) |
+| Live partials | yes | **no** |
+| Text arrives | during speech | ~0.6s after you stop |
+| VRAM | 0 | ~5.8 GB (served) |
+
+Accuracy is tied; Qwen is 8x faster and uses a GPU Moonshine cannot touch, but
+gives up the live transcript. `python -m voice_client.miccheck --qwen`
+reproduces this table on demand.
+
+**VRAM depends on how it is served.** The in-process `vllm.LLM()` API profiled
+itself into needing 7.39 GB -- its memory profiling overshoots for an ASR
+workload with `max_model_len` far larger than a transcript needs. Serving it
+properly with `vllm.entrypoints.openai.api_server` and an explicit
+`--kv-cache-memory` (see `scripts_qwen_serve.sh`) drops that to **5.82 GB**.
+Together with Kokoro TTS on the same GPU (620 MiB) that is **6.45 GB total**,
+measured -- both fit on an 8 GB card with room to spare, which the in-process
+figure alone would have said was impossible.
+
+### 7.3 A second, separate CUDA-13 trap
+
+§1.1 covers onnxruntime-gpu silently falling back to CPU on driver <R580. vLLM
+has its own, unrelated version of the same failure mode: a bare `pip install
+vllm` resolves torch ≥2.12, which pulls `nvidia-cudnn-cu13` -- CUDA 13, dead on
+this driver. Unlike the onnxruntime case this one does not fall back quietly;
+it fails to import. The newest vLLM installable on CUDA 12 is pinned in
+`scripts/setup_qwen.sh`, which also pins a downgraded `torchcodec` for the same
+reason (PyPI's default is a CUDA-13 build; without the downgrade, `from vllm
+import LLM` raises `ImportError` on `libtorchcodec_image.so`).
+
+**That pin will rot.** It names a specific commit on vLLM's nightly cu129
+channel, which is a frozen snapshot, not a maintained release line. The setup
+script's header explains how to find a replacement.
+
+### 7.4 Operational gotcha: vLLM's own subprocess outlives `kill`
+
+`vllm.entrypoints.openai.api_server` spawns a `VLLM::EngineCore` child that
+does **not** exit when the parent process is killed. Measured: stopping the
+parent left the child holding 5.8 GB of VRAM, which then starved the next
+`speech_server` start. After stopping the Qwen server, check `nvidia-smi` for a
+lingering `VLLM::EngineCore`, not just `ps` for the process you started.
+
+### 7.5 Bugs this surfaced, and where they are fixed
+
+Building the Qwen path exercised code paths synthesized-audio testing never
+reached. Each is detailed in its own subsection above: the park ring losing
+most of a real interruption (§5.11), GPU TTS outrunning barge-in (§5.11.1),
+inbound audio needing an explicit mute after a barge-in (§5.11.2), and Qwen
+hallucinating on near-silence (§5.11.3). None are Qwen-specific in the fix --
+they were latent for any fast-enough backend and Qwen is simply what exposed
+them first.
 
 ## References
 
