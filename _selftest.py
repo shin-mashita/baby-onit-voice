@@ -4,7 +4,7 @@ import asyncio, json, os, sys
 import baby_onit as b
 
 def tools_offline():
-    assert len(b.TOOLS) == 8
+    assert len(b.TOOLS) == 10  # 8 upstream + set_alarm/list_alarms (voice agent)
     assert b.json_repair("{'a': 1,}") == {"a": 1}
     assert b.normalize_host("https://api.ollama.com/v1", True) == "https://api.ollama.com"
     assert b.normalize_host("http://x:8000", False) == "http://x:8000/v1"

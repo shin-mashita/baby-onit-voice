@@ -17,6 +17,20 @@ dependencies = [
   "keyring>=24.0",
 ]
 
+[project.optional-dependencies]
+# Voice agent. Kept out of the core deps so `pip install -e .` still gives the
+# plain text harness: McpHub imports `mcp` lazily, and nothing in baby_onit.py
+# imports the speech stack at all.
+voice = [
+  "mcp>=2.0",            # MCP client for the TTS control plane
+  "moonshine-voice>=0.1.5",  # streaming ASR + Kokoro-vocoder TTS, CPU-only
+  "websockets>=12.0",    # ASR + TTS audio transports
+  "starlette>=0.37",     # ASGI app hosting the MCP + audio endpoints
+  "uvicorn>=0.30",       # server for both
+  "sounddevice>=0.5",    # mic capture and playback
+  "numpy>=1.26",
+]
+
 [project.scripts]
 baby-onit = "baby_onit:main"
 
@@ -25,4 +39,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-include = ["baby_onit.py"]
+include = ["baby_onit.py", "speech_server", "voice_client"]

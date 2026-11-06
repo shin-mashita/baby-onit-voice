@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import inspect
 import json
@@ -38,10 +39,23 @@ DEFAULTS = {
         "history_budget_tokens": 8000,  # hard cap on replayed history (pre-call trim)
         "temperature": 0.6,
         "top_p": 0.95,
+        # Gateways (Portkey, LiteLLM) route on headers, not on the URL path.
+        "extra_headers": {},
+        # A gateway host hides the upstream model, so the provider quirks keyed
+        # on host substrings below cannot see what they are talking to. Name the
+        # upstream family here when fronting one: anthropic|openai|generic.
+        "upstream": "auto",
     },
     "data_path": "~/baby-sandbox",  # the agent's jail root (cwd for all tools)
     "enforce_jail": True,  # confine file tools to data_path (onit: _validate_*_path)
     "block_dangerous": True,  # refuse NEVER_ASK commands in bash (onit: command_policy)
+    "voice": False,  # voice mode: spoken-style prompt + always-on tool surface
+    # Replay prior turns from session_history.jsonl on `chat` startup. Off by
+    # default: a new session starting inside an old conversation is surprising,
+    # and stale turns silently consume history_budget_tokens of every request.
+    # `chat --resume` opts in for one session; `\reset` clears mid-session.
+    "session_memory": False,
+    "mcp": {"servers": {}},  # name -> {url, headers}; streamable-HTTP MCP servers
 }
 
 
@@ -231,7 +245,30 @@ class Provider:
             api_key=key or "EMPTY",
             max_retries=0,
             timeout=httpx.Timeout(connect=30, read=300, write=30, pool=30),
+            # Portkey/LiteLLM select the upstream provider with x-portkey-* (or
+            # equivalent) headers; without these a gateway host 404s or 401s.
+            default_headers=self._extra_headers(),
         )
+
+    def _extra_headers(self) -> dict[str, str] | None:
+        """serving.extra_headers as a header mapping, or None.
+
+        Validated here because the natural mistake is to write the header *name*
+        as a bare string. Left unchecked that reaches httpx as a str and dies
+        several frames deep in the SDK with "'str' object is not a mapping",
+        which says nothing about the config key that caused it.
+        """
+        raw = self.cfg["serving"].get("extra_headers")
+        if not raw:
+            return None
+        if not isinstance(raw, dict):
+            raise SystemExit(
+                f"serving.extra_headers must be a mapping of header name to value, "
+                f"not {type(raw).__name__} ({raw!r}).\nIn config.yaml:\n"
+                f"  serving:\n    extra_headers:\n"
+                f"      x-portkey-virtual-key: your-virtual-key"
+            )
+        return {str(k): str(v) for k, v in raw.items()}
 
     async def close_client(self) -> None:
         """Drop pooled connections on the loop that opened them."""
@@ -266,13 +303,22 @@ class Provider:
             models[self.host] = model
             _save_models(models)
 
-    async def _stream_with_retry(self, body: dict) -> list:
-        """Stream a completion, retrying the provider's intermittent empty body."""
+    async def _stream_with_retry(self, body: dict):
+        """Yield completion chunks as they arrive, retrying an empty body.
+
+        A retry is only honourable until the first chunk reaches the caller:
+        past that point the text has already been handed to the voice pipeline
+        and replaying the call would speak the opening twice.
+        """
         for attempt in range(3):
+            started = False
             try:
-                return [c async for c in await self.client.chat.completions.create(**body)]
+                async for c in await self.client.chat.completions.create(**body):
+                    started = True
+                    yield c
+                return
             except Exception as e:
-                if "empty response" not in str(e).lower():
+                if started or "empty response" not in str(e).lower():
                     raise
                 if attempt == 2:
                     raise RuntimeError(
@@ -282,13 +328,17 @@ class Provider:
                     ) from e
                 await asyncio.sleep(1.5 * (attempt + 1))
 
-    async def _stream_ollama(self, kwargs: dict) -> list:
+    async def _stream_ollama(self, kwargs: dict):
         """Ollama stream with the same empty-body retry as _stream_with_retry."""
         for attempt in range(3):
+            started = False
             try:
-                return [c async for c in await self.client.chat(**kwargs)]
+                async for c in await self.client.chat(**kwargs):
+                    started = True
+                    yield c
+                return
             except Exception as e:
-                if "empty response" not in str(e).lower():
+                if started or "empty response" not in str(e).lower():
                     raise
                 if attempt == 2:
                     raise RuntimeError(
@@ -314,18 +364,25 @@ class Provider:
             }
             if tools:
                 kwargs["tools"] = tools
-            chunks = await self._stream_ollama(kwargs)
-            content = "".join(c.message.content or "" for c in chunks)
-            thinking = "".join(getattr(c.message, "thinking", "") or "" for c in chunks)
-            if stream_cb:
-                [stream_cb(c.message.content or "") for c in chunks]  # never stream thinking
-            calls = [
-                {"name": tc.function.name, "arguments": dict(tc.function.arguments or {})}
-                for c in chunks
-                for tc in c.message.tool_calls or []
-            ]
+            parts: list[str] = []
+            think_parts: list[str] = []
+            calls: list[dict] = []
+            u = None
+            async for c in self._stream_ollama(kwargs):
+                piece = c.message.content or ""
+                parts.append(piece)
+                think_parts.append(getattr(c.message, "thinking", "") or "")
+                if piece and stream_cb:
+                    stream_cb(piece)  # live, as it arrives; never stream thinking
+                calls += [
+                    {"name": tc.function.name, "arguments": dict(tc.function.arguments or {})}
+                    for tc in c.message.tool_calls or []
+                ]
+                if c.done:
+                    u = getattr(c, "usage", None) or c  # nested or flat
+            content = "".join(parts)
+            thinking = "".join(think_parts)
             raw_calls = [{"function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]
-            u = next((getattr(c, "usage", None) or c for c in chunks if c.done), None)  # nested or flat
             usage = (
                 {
                     "prompt_tokens": getattr(u, "prompt_eval_count", 0) or 0,
@@ -352,30 +409,37 @@ class Provider:
         }
         if tools:
             body["tools"] = tools
-        if "api.anthropic.com" not in self.host:  # newer Claude models reject these params
+        upstream = self.upstream_family()
+        if upstream != "anthropic":  # newer Claude models reject these params
             body["temperature"], body["top_p"] = s["temperature"], s["top_p"]
-        body["max_completion_tokens" if "api.openai.com" in self.host else "max_tokens"] = s["max_tokens"]
+        body["max_completion_tokens" if upstream == "openai" else "max_tokens"] = s["max_tokens"]
         if s["think"] and self.host_has_thinking():
             body["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
-        chunks = await self._stream_with_retry(body)
-        usage = next(
-            (
-                {"prompt_tokens": c.usage.prompt_tokens, "completion_tokens": c.usage.completion_tokens}
-                for c in chunks
-                if c.usage
-            ),
-            {},
-        )
-        deltas = [c.choices[0].delta for c in chunks if c.choices]
-        content = "".join(d.content or "" for d in deltas)
-        if stream_cb:
-            [stream_cb(d.content or "") for d in deltas]
+        usage: dict = {}
+        parts: list[str] = []
         pending: dict[str, dict] = {}  # index -> accumulating tool call
-        for tc in (tc for d in deltas for tc in d.tool_calls or []):
-            slot = pending.setdefault(tc.index, {"name": "", "arguments": "", "id": tc.id})
-            if tc.function:
-                slot["name"] = tc.function.name or slot["name"]
-                slot["arguments"] += tc.function.arguments or ""
+        # One pass: emit each delta to stream_cb the moment it lands, so the
+        # voice pipeline can start speaking before the completion is finished.
+        async for c in self._stream_with_retry(body):
+            if c.usage:
+                usage = {
+                    "prompt_tokens": c.usage.prompt_tokens,
+                    "completion_tokens": c.usage.completion_tokens,
+                }
+            if not c.choices:
+                continue
+            d = c.choices[0].delta
+            piece = d.content or ""
+            if piece:
+                parts.append(piece)
+                if stream_cb:
+                    stream_cb(piece)
+            for tc in d.tool_calls or []:
+                slot = pending.setdefault(tc.index, {"name": "", "arguments": "", "id": tc.id})
+                if tc.function:
+                    slot["name"] = tc.function.name or slot["name"]
+                    slot["arguments"] += tc.function.arguments or ""
+        content = "".join(parts)
         calls, raw_calls = [], []
         for slot in pending.values():
             if not slot["name"]:
@@ -399,8 +463,34 @@ class Provider:
             usage,
         )
 
+    def upstream_family(self) -> str:
+        """Which dialect the far end speaks: anthropic|openai|generic.
+
+        The host URL is only a reliable signal when you talk to the provider
+        directly. Behind a gateway (Portkey, LiteLLM) every model shares one
+        hostname, so serving.upstream names the family explicitly; "auto" keeps
+        the original host sniff for direct endpoints.
+        """
+        declared = (self.cfg["serving"].get("upstream") or "auto").lower()
+        if declared != "auto":
+            return declared
+        if "api.anthropic.com" in self.host:
+            return "anthropic"
+        if "api.openai.com" in self.host:
+            return "openai"
+        # A gateway with no declared upstream: infer from the model id, which is
+        # the only thing left that names the real model.
+        m = (self.model or "").lower()
+        if "claude" in m:
+            return "anthropic"
+        if m.startswith(("gpt-", "o1", "o3", "o4")):
+            return "openai"
+        return "generic"
+
     def host_has_thinking(self) -> bool:
         """vLLM/SGLang expose thinking via chat_template_kwargs; no-op elsewhere."""
+        if (self.cfg["serving"].get("upstream") or "auto").lower() != "auto":
+            return False  # a named upstream is a hosted API, not a local server
         return any(k in self.host for k in ("vllm", "sglang", "8000", "8001", "30000"))
 
 
@@ -425,9 +515,44 @@ works — the harness authenticates git via GIT_ASKPASS. Never hunt for a token 
 """
 
 
+# Voice mode: everything the model says is spoken aloud by a TTS engine, so the
+# shape of a good answer changes completely. Appended to SYSTEM_PROMPT, never a
+# replacement -- tool routing and credential rules still apply.
+VOICE_PROMPT = """\
+
+You are speaking out loud. Everything you write is sent to a speech synthesizer \
+and heard by a person, so:
+- Write what a person would say, not what they would read. No markdown, no \
+bullet lists, no tables, no code blocks, no emoji, no URLs read out character \
+by character. Numbers and units in words when that is how you would say them.
+- Short sentences. The synthesizer speaks one sentence at a time, so a long \
+clause is a long silence.
+- Answer the question first, in one or two sentences. Offer detail only if it \
+was asked for.
+
+Speaking is a tool call: `speak`. It returns immediately -- it does not wait \
+for the audio to finish -- so you can keep working while your words play.
+- Call `speak` as your FIRST action on any task that will take more than a \
+moment, before any other tool. Silence reads as a broken agent.
+- While a long task runs, call `speak` again at each step to say what you are \
+doing now. Keep each one to a sentence.
+- Your final answer is spoken too, so end in plain prose.
+
+A voice activity detector is listening the whole time you talk. If the person \
+starts speaking, your speech is cut off mid-sentence and the rest of your reply \
+is discarded. That is normal and expected -- it is not an error, and you should \
+not apologise for it or try to resume where you left off. Treat whatever they \
+said as the next thing to answer, and assume they only heard the part that \
+played before they interrupted.
+"""
+
+
 def build_system_prompt(cfg: dict) -> str:
     """Render the system prompt with the working directory and today's date."""
-    return SYSTEM_PROMPT.format(data_path=cfg["data_path"], today=time.strftime("%Y-%m-%d"))
+    prompt = SYSTEM_PROMPT
+    if cfg.get("voice"):
+        prompt += VOICE_PROMPT
+    return prompt.format(data_path=cfg["data_path"], today=time.strftime("%Y-%m-%d"))
 
 
 # S5. Tool implementations — tools are functions with a JSON-schema business card.
@@ -697,6 +822,44 @@ def tool_local_search(query: str, top_k: int = 5) -> str:
     )
 
 
+def tool_set_alarm(when: str, label: str = "alarm") -> str:
+    """Schedule a one-shot alarm. `when` is HH:MM (24h), "7am", or "in 10 minutes"."""
+    import datetime as _dt
+
+    now = _dt.datetime.now()
+    t = (when or "").strip().lower()
+    if m := re.fullmatch(r"in\s+(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hour|hours)", t):
+        n, unit = int(m[1]), m[2][0]
+        at = now + _dt.timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours"}[unit]: n})
+    elif m := re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t):
+        hh, mm, ap = int(m[1]), int(m[2] or 0), m[3]
+        if ap == "pm" and hh != 12:
+            hh += 12
+        elif ap == "am" and hh == 12:
+            hh = 0
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return _tool_error("E_ARGS", tool="set_alarm", bad=f"{when!r} is not a valid time")
+        at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if at <= now:
+            at += _dt.timedelta(days=1)  # a time already past means tomorrow
+    else:
+        return _tool_error(
+            "E_ARGS", tool="set_alarm", bad=f"cannot parse {when!r}",
+            accepts=["HH:MM", "7am", "in 10 minutes"],
+        )
+    _ALARMS.append({"at": at.isoformat(timespec="seconds"), "label": label})
+    delta = at - now
+    mins = round(delta.total_seconds() / 60)
+    return json.dumps(
+        {"set": at.strftime("%H:%M"), "label": label, "in_minutes": mins, "total": len(_ALARMS)}
+    )
+
+
+def tool_list_alarms() -> str:
+    """List the alarms set this session, soonest first."""
+    return json.dumps(sorted(_ALARMS, key=lambda a: a["at"])) if _ALARMS else "no alarms set"
+
+
 def tool_grep(pattern: str, path: str = ".", file_pattern: str = "*") -> str:
     """Recursive regex search across DATA_PATH, bounded on matches/bytes/line-len."""
     rx, out, total = re.compile(pattern), [], 0
@@ -762,10 +925,154 @@ for _name, _desc, _fn in [
     ("edit_file", "Replace an exact old_string with new_string.", tool_edit_file),
     ("local_search", "BM25 search over files in the working directory.", tool_local_search),
     ("grep", "Recursive regex search across files.", tool_grep),
+    ("set_alarm", "Set a one-shot alarm. when='07:00', '7am', or 'in 10 minutes'.", tool_set_alarm),
+    ("list_alarms", "List alarms set this session.", tool_list_alarms),
 ]:
     tool(_name, _desc, _fn)
-READ_ONLY = {"web_search", "fetch_content", "read_file", "local_search", "grep"}
+READ_ONLY = {"web_search", "fetch_content", "read_file", "local_search", "grep", "list_alarms"}
+# Session-scoped alarms. Deliberately not persisted: the voice agent is a
+# long-lived process, and an alarm that outlives it would fire into silence.
+_ALARMS: list[dict] = []
 _call_history: list[tuple[str, str]] = []
+
+
+# S6.5. MCP client — the one kind of tool that cannot be an in-process function.
+# baby-onit deliberately inlines its tools (docs/PLAN.md), and that is still the
+# right default. The voice agent needs an exception: the speech engine runs on a
+# different machine from the harness, owns a GPU-sized pile of model state, and
+# is shared with the audio data plane. MCP is how the model reaches across that
+# process boundary without the harness caring where the far end lives.
+class McpHub:
+    """Connects streamable-HTTP MCP servers and grafts their tools onto TOOLS.
+
+    Sessions are async context managers held open on a single event loop, so the
+    hub must be opened and closed on the loop that will run the tool calls. Voice
+    mode owns one long-lived loop (see run_voice) and opens the hub once; the
+    one-shot paths open and close it per turn.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.servers: dict[str, dict] = (cfg.get("mcp") or {}).get("servers") or {}
+        self.sessions: dict[str, Any] = {}  # server name -> ClientSession
+        self.registered: list[str] = []  # TOOLS keys this hub added, for clean removal
+        self._holders: list[asyncio.Task] = []
+        self._shutdown: asyncio.Event | None = None
+
+    async def open(self, on_event: Callable[[str, str], None] | None = None) -> int:
+        """Connect every configured server and register its tools. Returns the count."""
+        if not self.servers:
+            return 0
+        self._shutdown = asyncio.Event()
+        n = 0
+        for name, spec in self.servers.items():
+            url = spec if isinstance(spec, str) else spec.get("url")
+            if not url:
+                continue
+            ready: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._holders.append(asyncio.create_task(self._hold(name, url, ready), name=f"mcp:{name}"))
+            try:
+                session, listed = await ready
+            except Exception as e:  # noqa: BLE001 — a dead MCP server must not kill the agent
+                if on_event:
+                    on_event("status", f"mcp {name}: unreachable at {url} ({type(e).__name__}: {e})")
+                continue
+            self.sessions[name] = session
+            for t in listed.tools:
+                n += 1 if self._register(name, session, t, on_event) else 0
+        return n
+
+    async def _hold(self, name: str, url: str, ready: asyncio.Future) -> None:
+        """Own one session for its whole life, inside a single task.
+
+        The transport nests anyio task groups, and an anyio cancel scope has to
+        be exited by the task that entered it. An AsyncExitStack unwound from
+        close() is a different task, which fails with "attempted to exit cancel
+        scope in a different task". So the context is entered here, parked on an
+        event, and exited here -- enter and exit are always the same task.
+        """
+        from mcp import Client
+
+        try:
+            # Client takes the URL directly and does connect+initialize itself,
+            # so there is no transport plumbing to hold here.
+            async with Client(url) as session:
+                listed = await session.list_tools()
+                if not ready.done():
+                    ready.set_result((session, listed))
+                assert self._shutdown is not None
+                await self._shutdown.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — surfaced to open() via the future
+            if not ready.done():
+                ready.set_exception(e)
+
+    def _register(self, server: str, session: Any, t: Any, on_event=None) -> bool:
+        """Graft one MCP tool into TOOLS under a non-colliding name."""
+        key = t.name
+        if key in TOOLS:  # in-process tools win; the MCP one gets qualified
+            key = f"{server}_{t.name}"
+            if key in TOOLS:
+                if on_event:
+                    on_event("status", f"mcp {server}: skipping {t.name} (name taken)")
+                return False
+
+        async def call(_s=session, _n=t.name, **args) -> str:
+            res = await _s.call_tool(_n, args)
+            return _mcp_result_text(res)
+
+        # The model only ever sees the schema, so hand it the server's own
+        # input_schema verbatim rather than re-deriving one from `call`'s **args.
+        schema = getattr(t, "input_schema", None) or {"type": "object", "properties": {}, "required": []}
+        TOOLS[key] = (
+            {
+                "type": "function",
+                "function": {
+                    "name": key,
+                    "description": (t.description or f"{t.name} (via MCP server {server})").strip(),
+                    "parameters": schema,
+                },
+            },
+            call,
+        )
+        self.registered.append(key)
+        return True
+
+    async def close(self) -> None:
+        """Drop every session and un-register the tools this hub added."""
+        for key in self.registered:
+            TOOLS.pop(key, None)
+        self.registered.clear()
+        self.sessions.clear()
+        if self._shutdown is not None:
+            self._shutdown.set()  # releases each holder to unwind its own contexts
+        if self._holders:
+            await asyncio.gather(*self._holders, return_exceptions=True)
+            self._holders.clear()
+        self._shutdown = None
+
+
+def _mcp_result_text(res: Any) -> str:
+    """Flatten an MCP CallToolResult into the plain string dispatch() expects.
+
+    A failing MCP tool reports prose in a normal content block, but baby-onit's
+    tool layer speaks machine-readable error JSON (see _tool_error) because the
+    model recovers from that in one retry and re-calls the same broken form when
+    it is handed prose. So a server-side failure is re-wrapped as E_TOOL.
+    """
+    if getattr(res, "is_error", False):
+        return _tool_error("E_TOOL", tool="mcp", err=_mcp_join(res)[:200])
+    out = _mcp_join(res)
+    sc = getattr(res, "structured_content", None)
+    return out or (json.dumps(sc, ensure_ascii=False) if sc else "")
+
+
+def _mcp_join(res: Any) -> str:
+    """Concatenate the text blocks of an MCP result, ignoring image/audio parts."""
+    return "\n".join(
+        c.text for c in (getattr(res, "content", None) or []) if getattr(c, "type", None) == "text"
+    ).strip()
 
 
 def json_repair(s: str) -> Any:
@@ -836,8 +1143,14 @@ async def dispatch(name: str, args: dict) -> str:
     if _call_history.count(key) >= 5:
         return _tool_error("E_LOOP", tool=name, repeats=5,
                            hint="same call 5x — change approach or answer without tools")
+    fn = TOOLS[name][1]
     try:
-        return str(await asyncio.wait_for(asyncio.to_thread(TOOLS[name][1], **args), timeout=330))
+        # MCP tools are natively async; in-process tools are blocking functions
+        # that have to leave the event loop free for the audio sockets. Build
+        # the awaitable inside the try: an async fn validates its arguments at
+        # call time, and that TypeError is the E_ARGS path below.
+        call = fn(**args) if inspect.iscoroutinefunction(fn) else asyncio.to_thread(fn, **args)
+        return str(await asyncio.wait_for(call, timeout=330))
     except TypeError as e:
         import inspect as _inspect
         sig = list(_inspect.signature(TOOLS[name][1]).parameters)
@@ -944,8 +1257,13 @@ async def agent_loop(
 
         # P5: on the first model call, hide the tool surface from tasks that
         # cannot need one; later iterations always see tools (mid-episode).
+        # Voice mode opts out: speaking IS a tool call here, so hiding the tool
+        # surface makes the agent answer silently. The guard keys off keywords
+        # in the task text, and spoken requests routinely miss them -- "set an
+        # alarm at 7 am" matches no hint, so without this the agent would think
+        # with no way to say anything.
         call_tools = [schema for schema, _ in TOOLS.values()]
-        if iteration == 1 and not _task_needs_tools(task):
+        if iteration == 1 and not cfg.get("voice") and not _task_needs_tools(task):
             call_tools = None
         msg, usage = await provider.chat(
             messages,
@@ -1199,6 +1517,86 @@ def _provider_label(host: str) -> str:
     return "openai-compat" if "/v1" in h or "openai" in h else (h.split("/")[0] or "?")
 
 
+# S8.5. Voice session — one long-lived loop instead of one loop per turn.
+# chat/run call asyncio.run() per turn (see _run_turn), which is fine for a REPL
+# but cannot host a microphone: the ASR socket, the audio socket and the MCP
+# sessions all have to outlive a single answer, and a barge-in has to cancel a
+# turn that is still running. This owns that lifecycle; voice_client drives it.
+class VoiceSession:
+    """A persistent agent session: MCP tools open, one turn in flight, cancellable.
+
+    Usage from the audio client::
+
+        async with VoiceSession(cfg) as vs:
+            answer = await vs.ask("what's the weather today")   # cancellable
+            ...
+            vs.barge_in()        # from the VAD callback; cancels the live turn
+    """
+
+    def __init__(self, cfg: dict, on_event: Callable[[str, str], None] | None = None):
+        self.cfg = cfg
+        self.on_event = on_event
+        self.provider = Provider(cfg)
+        self.hub = McpHub(cfg)
+        self.history: list[dict] = []  # replayed as user/assistant pairs across turns
+        self._turn: asyncio.Task | None = None
+        self.interrupted = False
+
+    async def __aenter__(self) -> VoiceSession:
+        if not self.provider.model:
+            self.provider.model = await self.provider.autodetect_model()
+            self.provider.remember_model()
+        n = await self.hub.open(on_event=self.on_event)
+        if self.on_event:
+            self.on_event("status", f"mcp: {n} tool(s) from {len(self.hub.sessions)} server(s)")
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.cancel()
+        await self.hub.close()
+        await self.provider.close_client()
+
+    async def ask(self, task: str, stream_cb: Callable[[str], None] | None = None) -> str | None:
+        """Run one turn. Returns None if a barge-in cancelled it."""
+        await self.cancel()  # a new utterance always supersedes the previous turn
+        self.interrupted = False
+        self._turn = asyncio.create_task(
+            agent_loop(
+                task,
+                self.cfg,
+                self.provider,
+                on_event=self.on_event,
+                session_history=self.history,
+                verbose=self.cfg.get("verbose"),
+            )
+        )
+        try:
+            answer = await self._turn
+        except asyncio.CancelledError:
+            # Expected on barge-in. Tool results already in self.history stay
+            # there, so the next turn still knows what was done.
+            return None
+        finally:
+            self._turn = None
+        self.history.append({"task": task, "response": answer})
+        return answer
+
+    def barge_in(self) -> None:
+        """Cancel the turn in flight. Safe to call from a VAD callback."""
+        self.interrupted = True
+        if self._turn is not None and not self._turn.done():
+            self._turn.cancel()
+
+    async def cancel(self) -> None:
+        """Cancel the live turn and wait for it to actually unwind."""
+        t = self._turn
+        if t is not None and not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+        self._turn = None
+
+
 def _run_turn(provider, coro):
     """One turn on a fresh loop, then close the client's pool on that loop."""
 
@@ -1249,9 +1647,19 @@ def ui_chat(cfg: dict) -> None:
         provider.model = asyncio.run(provider.autodetect_model())
         provider.remember_model()  # persist per-endpoint so setup remembers it
         console.print(f"[dim]auto-detected model: {provider.model}[/]")
-    history = load_session_history(cfg)  # S7.5: replay prior turns this session
-    if history:
-        console.print(f"[dim]resumed session: {len(history)} prior turn(s)[/]")
+    # S7.5: prior turns are replayed only when asked for. Otherwise the file is
+    # cleared here rather than merely ignored, so it holds this session alone and
+    # a later --resume picks up the last conversation instead of every one ever.
+    if cfg.get("session_memory"):
+        history = load_session_history(cfg)
+        if history:
+            console.print(f"[dim]resumed session: {len(history)} prior turn(s)[/]")
+    else:
+        had = len(load_session_history(cfg))
+        _history_path(cfg).unlink(missing_ok=True)
+        history = []
+        if had:
+            console.print(f"[dim]fresh session: cleared {had} prior turn(s) · --resume to keep them[/]")
     seed = [rec["task"] for rec in history if rec.get("task", "").strip()]
     while True:
         try:
@@ -1272,6 +1680,9 @@ def ui_chat(cfg: dict) -> None:
                 console.print(
                     "\\model show model · \\host show host · \\key set key · "
                     "\\reset clear session memory · \\quit exit"
+                )
+                console.print(
+                    "[dim]sessions start fresh; `chat --resume` replays the previous one[/]"
                 )
             elif line == "\\reset":
                 _history_path(cfg).unlink(missing_ok=True)
@@ -1488,10 +1899,23 @@ def main(argv: list[str] | None = None) -> None:
     # The same flag after the subcommand too. default=SUPPRESS: when the flag
     # is absent the subparser leaves the namespace alone instead of
     # overwriting the top-level value with its own default.
+    p_chat = sub.add_parser("chat", help="interactive chat")
+    p_chat.add_argument(
+        "--resume",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="replay prior turns from session_history.jsonl (default: start fresh)",
+    )
     for p in (
-        sub.add_parser("chat", help="interactive chat"),
+        p_chat,
         p_run,
     ):
+        p.add_argument(
+            "--voice",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="spoken-style prompt + always-on tool surface (needs an mcp.servers TTS entry)",
+        )
         p.add_argument(
             "--max-context-tokens",
             type=int,
@@ -1517,6 +1941,10 @@ def main(argv: list[str] | None = None) -> None:
     ):
         if v is not None:
             cfg["serving"][k] = v
+    if getattr(args, "voice", False):  # voice is top-level, not a serving knob
+        cfg["voice"] = True
+    if getattr(args, "resume", False):
+        cfg["session_memory"] = True
     if args.data_path:
         cfg["data_path"] = str(Path(args.data_path).expanduser())
     if args.cmd == "setup":

@@ -1,10 +1,11 @@
-__pycache__/
-*.pyc
-.venv/
 dist/
-*.egg-info/
 .DS_Store
-.onit
-tmp
+*.egg-info/
 local_search/
 *.log
+.onit
+*.pyc
+__pycache__/
+tmp
+.venv/
+voice.yaml
